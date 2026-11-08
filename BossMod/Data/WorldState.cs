@@ -18,6 +18,7 @@ public sealed class WorldState
     public readonly PartyState Party;
     public readonly ClientState Client = new();
     public readonly DeepDungeonState DeepDungeon = new();
+    public readonly DeepDungeonInteractionHistory DeepDungeonInteractions = new();
     public readonly NetworkState Network = new();
     public readonly ReplayState ReplayState = new();
 

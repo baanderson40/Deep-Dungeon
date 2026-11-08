@@ -81,11 +81,11 @@ public abstract partial class AutoClear : ZoneModule
     private readonly Dictionary<ulong, int> _chestContentsSilver = [];
     private readonly Dictionary<ulong, string> _lastOvercapDecision = [];
     private readonly Dictionary<PomanderID, (DateTime RequestedAt, byte Count, byte Flags)> _pendingPomanderReadbacks = [];
+    private long _lastAttributedInteractionSequence;
+    private string? _lastOvercapCorrelationLogKey;
+    private DateTime _lastOvercapCorrelationLogAt;
+    private int _suppressedOvercapCorrelationLogs;
     private readonly HashSet<ulong> _fakeExits = [];
-    private PomanderID? _lastChestContentsGold;
-    private DateTime _lastChestContentsGoldAt;
-    private bool _lastChestMagicite;
-    private DateTime _lastChestMagiciteAt;
     private DeepDungeonState.PomanderState[] _lastPomanderSnapshot = [];
     private bool _pomanderSnapshotReady;
     private DeepDungeonState.DungeonType _observedDungeon;
@@ -499,9 +499,12 @@ public abstract partial class AutoClear : ZoneModule
         switch (op.MessageId)
         {
             case 7222: // pomander overcap
-                _lastChestContentsGold = (PomanderID)op.Args[0];
-                _lastChestContentsGoldAt = World.CurrentTime;
-                Service.Log($"[AutoDD] overcap message observed: pomander={_lastChestContentsGold}, correlation pending nearest eligible gold coffer; stock/effect outcome not implied.");
+                if (op.Args.Length == 0 || op.Args[0] <= 0 || op.Args[0] >= (int)PomanderID.Count)
+                {
+                    Service.Log($"[AutoDD] overcap correlation rejected: message=7222, reason=invalid pomander argument ({(op.Args.Length > 0 ? op.Args[0] : "missing")}).");
+                    break;
+                }
+                CorrelateOvercapMessage("pomander", (uint)OID.GoldCoffer, (PomanderID)op.Args[0]);
                 break;
             case 7248: // transference initiated
                 ClearState();
@@ -513,15 +516,45 @@ public abstract partial class AutoClear : ZoneModule
                 break;
             case 9208: // magicite overcap
             case 10287: // demiclone overcap
-                _lastChestMagicite = true;
-                _lastChestMagiciteAt = World.CurrentTime;
-                Service.Log($"[AutoDD] magicite/demiclone overcap message observed (message={op.MessageId}); correlation pending nearest eligible silver coffer.");
+                CorrelateOvercapMessage(op.MessageId == 9208 ? "magicite" : "demiclone", (uint)OID.SilverCoffer, null);
                 break;
             case 11251:
                 if (op.Args[1] == 4) // mazeroot balm used, reveals map and traps
                     _trapsCurrentFloor.Clear();
                 break;
         }
+    }
+
+    private void CorrelateOvercapMessage(string kind, uint expectedChestOID, PomanderID? pomander)
+    {
+        var now = World.CurrentTime;
+        var attribution = DeepDungeonPolicy.CorrelateOvercapMessage(
+            now, (int)Palace.DungeonId, Palace.Floor, expectedChestOID, World.DeepDungeonInteractions.Snapshot(now), _lastAttributedInteractionSequence);
+        var status = attribution.Status;
+        if (status == DeepDungeonPolicy.OvercapAttributionStatus.Matched)
+        {
+            _lastAttributedInteractionSequence = attribution.InteractionSequence;
+            var chest = World.Actors.Find(attribution.ActorID);
+            if (chest == null || !chest.IsTargetable || chest.OID != expectedChestOID || !DeepDungeonInteractionHistory.IsTreasureInteractionTarget(chest.Type, chest.OID))
+                status = DeepDungeonPolicy.OvercapAttributionStatus.ActorUnavailable;
+            else if (pomander is { } pid)
+                _chestContentsGold[chest.InstanceID] = pid;
+            else
+                _chestContentsSilver[chest.InstanceID] = 1;
+        }
+
+        var candidates = string.Join(",", attribution.CandidateActorIDs);
+        var logKey = $"{kind}/{pomander}/{status}/{attribution.ActorID}/{candidates}/{Palace.DungeonId}/{Palace.Floor}";
+        if (logKey == _lastOvercapCorrelationLogKey && now - _lastOvercapCorrelationLogAt < TimeSpan.FromSeconds(5))
+        {
+            ++_suppressedOvercapCorrelationLogs;
+            return;
+        }
+        var suppressed = _suppressedOvercapCorrelationLogs;
+        _suppressedOvercapCorrelationLogs = 0;
+        _lastOvercapCorrelationLogKey = logKey;
+        _lastOvercapCorrelationLogAt = now;
+        Service.Log($"[AutoDD] overcap correlation: kind={kind}, pomander={pomander?.ToString() ?? "n/a"}, result={status}, evidenceAge={attribution.EvidenceAge.TotalSeconds:F2}s, selectedChest={(attribution.ActorID == 0 ? "none" : attribution.ActorID.ToString())}, candidateCount={attribution.CandidateCount}, candidates=[{candidates}], dungeon={Palace.DungeonId}, floor={Palace.Floor}, suppressedIdentical={suppressed}; interaction issuance is not proof of server outcome, stock consumption, or effect.");
     }
 
     private void OnClientActionRequested(ClientActionRequest request)
@@ -618,10 +651,13 @@ public abstract partial class AutoClear : ZoneModule
         ResetObjectiveProgress("floor state reset");
         Kills = 0;
         Array.Fill(_playerImmunes, default);
-        _lastChestContentsGold = null;
-        _lastChestMagicite = false;
         _chestContentsGold.Clear();
         _chestContentsSilver.Clear();
+        World.DeepDungeonInteractions.Clear();
+        _lastAttributedInteractionSequence = 0;
+        _lastOvercapCorrelationLogKey = null;
+        _lastOvercapCorrelationLogAt = default;
+        _suppressedOvercapCorrelationLogs = 0;
         _lastOvercapDecision.Clear();
         _pendingPomanderReadbacks.Clear();
         _lastSelectedActorGoalKey = null;
@@ -705,12 +741,6 @@ public abstract partial class AutoClear : ZoneModule
             return;
         _lastOvercapDecision[chest.InstanceID] = decision;
         Service.Log($"[AutoDD] overcap pomander candidate {(accepted ? "accepted" : "rejected")}: chest={chest.InstanceID}, pomander={pid}, stock={state.Count}, usable={state.Usable}, active={state.Active}, reason={reason}.");
-    }
-
-    private void LogOvercapAttribution(string kind, GoalObject selected, IEnumerable<GoalObject> candidates, TimeSpan messageAge, PomanderID? pomander = null)
-    {
-        var alternatives = candidates.Take(3).Select(candidate => $"{candidate.Actor.InstanceID}@{MathF.Sqrt(candidate.PlayerDistSq):F1}");
-        Service.Log($"[AutoDD] overcap attribution uses nearest-candidate heuristic: kind={kind}, pomander={pomander?.ToString() ?? "n/a"}, selectedChest={selected.Actor.InstanceID}, selectedDistance={MathF.Sqrt(selected.PlayerDistSq):F1}, alternatives=[{string.Join(",", alternatives)}], messageAge={messageAge.TotalSeconds:F1}s; attribution uncertain.");
     }
 
     private void ProcessAll<T>(List<T> items, Func<T, bool> expire, Action<T> action, Action<T>? onRemove = null)
@@ -906,24 +936,6 @@ public abstract partial class AutoClear : ZoneModule
         PickARoom(player, hints);
 
         InterestingObjects.SortBy(o => (o.Type, o.PlayerDistSq));
-
-        if (_lastChestContentsGold is PomanderID p && InterestingObjects.FirstOrNull(p => p.Type == GoalType.Treasure && p.Tier == 3) is { } goldOvercap)
-        {
-            var candidates = InterestingObjects.Where(candidate => candidate.Type == GoalType.Treasure && candidate.Tier == 3).ToArray();
-            LogOvercapAttribution("pomander", goldOvercap, candidates, World.CurrentTime - _lastChestContentsGoldAt, p);
-            _chestContentsGold[goldOvercap.Actor.InstanceID] = p;
-            _lastChestContentsGold = null;
-            return;
-        }
-
-        if (_lastChestMagicite && InterestingObjects.FirstOrNull(p => p.Type == GoalType.Treasure && p.Tier == 2) is { } silverOvercap)
-        {
-            var candidates = InterestingObjects.Where(candidate => candidate.Type == GoalType.Treasure && candidate.Tier == 2).ToArray();
-            LogOvercapAttribution("magicite/demiclone", silverOvercap, candidates, World.CurrentTime - _lastChestMagiciteAt);
-            _chestContentsSilver[silverOvercap.Actor.InstanceID] = 1;
-            _lastChestMagicite = false;
-            return;
-        }
 
         MostInterestingObject = InterestingObjects.FirstOrNull(o => DeepDungeonPolicy.ShouldConsiderActorForNavigation(o.Type == GoalType.Passage, PassageActorGoalAllowed));
         LogSelectedActorGoal(player);

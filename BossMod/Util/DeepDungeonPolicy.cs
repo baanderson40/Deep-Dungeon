@@ -48,6 +48,49 @@ internal static class DeepDungeonPolicy
         MissingDirectorOrSlot,
     }
 
+    internal enum OvercapAttributionStatus
+    {
+        Matched,
+        Ambiguous,
+        WrongFloorContext,
+        ExpiredOrFutureInteraction,
+        IncompatibleChest,
+        ActorUnavailable,
+        NoRecentInteraction,
+    }
+
+    internal readonly record struct OvercapAttribution(OvercapAttributionStatus Status, ulong ActorID, long InteractionSequence, int CandidateCount, ulong[] CandidateActorIDs, TimeSpan EvidenceAge);
+
+    internal static OvercapAttribution CorrelateOvercapMessage(
+        DateTime messageAt, int dungeonID, byte floor, uint expectedChestOID,
+        ReadOnlySpan<DeepDungeonInteractionHistory.TreasureCall> calls, long afterSequence = 0)
+    {
+        var allCalls = calls.ToArray().Where(call => call.Sequence > afterSequence).ToArray();
+        var objectCalls = allCalls.Where(call => call.ObjectID == expectedChestOID).ToArray();
+        var recentCalls = allCalls.Where(call => call.IssuedAt <= messageAt && messageAt - call.IssuedAt <= DeepDungeonInteractionHistory.Retention).ToArray();
+        var contextCalls = recentCalls.Where(call => call.DungeonID == dungeonID && call.Floor == floor).ToArray();
+        var compatibleCalls = contextCalls.Where(call => call.ObjectID == expectedChestOID).ToArray();
+        var actorIDs = compatibleCalls.Select(call => call.ActorID).Distinct().ToArray();
+        if (actorIDs.Length > 1)
+            return new(OvercapAttributionStatus.Ambiguous, 0, 0, actorIDs.Length, actorIDs.Take(3).ToArray(), messageAt - compatibleCalls.Max(call => call.IssuedAt));
+        if (actorIDs.Length == 1)
+        {
+            var latestCall = compatibleCalls.MaxBy(call => call.IssuedAt);
+            return new(OvercapAttributionStatus.Matched, actorIDs[0], latestCall.Sequence, 1, actorIDs, messageAt - latestCall.IssuedAt);
+        }
+        var otherContextIDs = objectCalls.Where(call => call.DungeonID != dungeonID || call.Floor != floor).Select(call => call.ActorID).Distinct().ToArray();
+        if (recentCalls.Any(call => call.ObjectID == expectedChestOID) && contextCalls.All(call => call.ObjectID != expectedChestOID))
+            return new(OvercapAttributionStatus.WrongFloorContext, 0, 0, otherContextIDs.Length, otherContextIDs.Take(3).ToArray(), TimeSpan.Zero);
+        if (objectCalls.Length > 0)
+            return new(OvercapAttributionStatus.ExpiredOrFutureInteraction, 0, 0, objectCalls.Select(call => call.ActorID).Distinct().Count(), objectCalls.Select(call => call.ActorID).Distinct().Take(3).ToArray(), TimeSpan.Zero);
+        if (contextCalls.Length > 0)
+        {
+            var incompatibleIDs = contextCalls.Select(call => call.ActorID).Distinct().ToArray();
+            return new(OvercapAttributionStatus.IncompatibleChest, 0, 0, incompatibleIDs.Length, incompatibleIDs.Take(3).ToArray(), TimeSpan.Zero);
+        }
+        return new(OvercapAttributionStatus.NoRecentInteraction, 0, 0, 0, [], TimeSpan.Zero);
+    }
+
     internal static bool ShouldNavigate(bool autoDDEnabled, bool hasManualDestination) => autoDDEnabled || hasManualDestination;
 
     internal static bool IsFloorContextReady(int dungeonID, int floor) => dungeonID != 0 && floor > 0;

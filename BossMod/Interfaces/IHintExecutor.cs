@@ -93,7 +93,7 @@ internal sealed class HintExecutor(WorldState ws, MovementOverride movementOverr
 
     private void UpdateTreasureInteractionDiagnostics(Actor? player, Actor? target, bool inRange)
     {
-        if (target?.Type != ActorType.Treasure)
+        if (target == null || !DeepDungeonInteractionHistory.IsTreasureInteractionTarget(target.Type, target.OID))
             target = null;
 
         var targetID = target?.InstanceID ?? 0;
@@ -153,10 +153,14 @@ internal sealed class HintExecutor(WorldState ws, MovementOverride movementOverr
 
     private void RecordTreasureInteractionRequest(Actor? target)
     {
-        if (target?.Type != ActorType.Treasure || target.InstanceID != _trackedTreasureTarget)
+        if (target == null || !DeepDungeonInteractionHistory.IsTreasureInteractionTarget(target.Type, target.OID))
             return;
 
         var now = ws.CurrentTime;
+        ws.DeepDungeonInteractions.RecordTreasureCall(target.InstanceID, target.OID, (int)ws.DeepDungeon.DungeonId, ws.DeepDungeon.Floor, now);
+        if (target.InstanceID != _trackedTreasureTarget)
+            return;
+
         if (_firstTreasureRequest == default)
             _firstTreasureRequest = now;
         ++_treasureRequestsSinceSummary;

@@ -159,6 +159,116 @@ public class DeepDungeonPolicyTests
     }
 
     [Fact]
+    public void OvercapAttributionMatchesRecentCompatibleInteractionCall()
+    {
+        var messageAt = new DateTime(2026, 1, 1, 0, 0, 5, DateTimeKind.Utc);
+        DeepDungeonInteractionHistory.TreasureCall[] calls =
+        [
+            new(123, 0x1EA13E, 1, 31, messageAt.AddSeconds(-2), 1),
+            new(456, 0x1EA13D, 1, 31, messageAt.AddSeconds(-1), 2),
+        ];
+
+        var result = DeepDungeonPolicy.CorrelateOvercapMessage(messageAt, 1, 31, 0x1EA13E, calls);
+
+        Assert.Equal(DeepDungeonPolicy.OvercapAttributionStatus.Matched, result.Status);
+        Assert.Equal((ulong)123, result.ActorID);
+        Assert.Equal(1, result.CandidateCount);
+        Assert.Equal(TimeSpan.FromSeconds(2), result.EvidenceAge);
+    }
+
+    [Theory]
+    [InlineData(ActorType.EventObj, DeepDungeonInteractionHistory.GoldCofferOID, true)]
+    [InlineData(ActorType.EventObj, DeepDungeonInteractionHistory.SilverCofferOID, true)]
+    [InlineData(ActorType.EventObj, 0x123456, false)]
+    [InlineData(ActorType.Treasure, 0x123456, true)]
+    public void CofferInteractionEvidenceAcceptsCofferOIDsRegardlessOfActorType(ActorType type, uint objectID, bool expected)
+        => Assert.Equal(expected, DeepDungeonInteractionHistory.IsTreasureInteractionTarget(type, objectID));
+
+    [Fact]
+    public void EventObjectCofferInteractionCorrelatesToGoldOvercap()
+    {
+        var messageAt = new DateTime(2026, 1, 1, 0, 0, 5, DateTimeKind.Utc);
+        var history = new DeepDungeonInteractionHistory();
+        Assert.True(DeepDungeonInteractionHistory.IsTreasureInteractionTarget(ActorType.EventObj, DeepDungeonInteractionHistory.GoldCofferOID));
+        history.RecordTreasureCall(123, DeepDungeonInteractionHistory.GoldCofferOID, 1, 31, messageAt.AddSeconds(-1));
+
+        var result = DeepDungeonPolicy.CorrelateOvercapMessage(
+            messageAt, 1, 31, DeepDungeonInteractionHistory.GoldCofferOID, history.Snapshot(messageAt));
+
+        Assert.Equal(DeepDungeonPolicy.OvercapAttributionStatus.Matched, result.Status);
+        Assert.Equal((ulong)123, result.ActorID);
+    }
+
+    [Fact]
+    public void OvercapAttributionAllowsRepeatedCallsToSameChestButRejectsMultipleChestCandidates()
+    {
+        var messageAt = new DateTime(2026, 1, 1, 0, 0, 5, DateTimeKind.Utc);
+        DeepDungeonInteractionHistory.TreasureCall[] repeatedSameChest =
+        [
+            new(123, 0x1EA13E, 1, 31, messageAt.AddSeconds(-2), 1),
+            new(123, 0x1EA13E, 1, 31, messageAt.AddSeconds(-1), 2),
+        ];
+        var matched = DeepDungeonPolicy.CorrelateOvercapMessage(messageAt, 1, 31, 0x1EA13E, repeatedSameChest);
+        Assert.Equal(DeepDungeonPolicy.OvercapAttributionStatus.Matched, matched.Status);
+        Assert.Equal(TimeSpan.FromSeconds(1), matched.EvidenceAge);
+        Assert.Equal(2, matched.InteractionSequence);
+        Assert.Equal(DeepDungeonPolicy.OvercapAttributionStatus.NoRecentInteraction,
+            DeepDungeonPolicy.CorrelateOvercapMessage(messageAt, 1, 31, 0x1EA13E, repeatedSameChest, matched.InteractionSequence).Status);
+
+        DeepDungeonInteractionHistory.TreasureCall[] twoChests =
+        [
+            new(123, 0x1EA13E, 1, 31, messageAt.AddSeconds(-2), 1),
+            new(456, 0x1EA13E, 1, 31, messageAt.AddSeconds(-1), 2),
+        ];
+        var ambiguous = DeepDungeonPolicy.CorrelateOvercapMessage(messageAt, 1, 31, 0x1EA13E, twoChests);
+        Assert.Equal(DeepDungeonPolicy.OvercapAttributionStatus.Ambiguous, ambiguous.Status);
+        Assert.Equal(2, ambiguous.CandidateCount);
+        Assert.Equal(new ulong[] { 123, 456 }, ambiguous.CandidateActorIDs);
+    }
+
+    [Theory]
+    [InlineData(1, 30, 0x1EA13E, "WrongFloorContext")]
+    [InlineData(1, 31, 0x1EA13D, "IncompatibleChest")]
+    [InlineData(1, 31, 0x1EA13E, "ExpiredOrFutureInteraction")]
+    public void OvercapAttributionRejectsWrongContextTypeOrTiming(int callDungeon, byte callFloor, uint callObjectID, string expectedStatus)
+    {
+        var messageAt = new DateTime(2026, 1, 1, 0, 0, 5, DateTimeKind.Utc);
+        var callAt = expectedStatus == "ExpiredOrFutureInteraction" ? messageAt.AddSeconds(-6) : messageAt.AddSeconds(-1);
+        DeepDungeonInteractionHistory.TreasureCall[] calls = [new(123, callObjectID, callDungeon, callFloor, callAt, 1)];
+
+        var result = DeepDungeonPolicy.CorrelateOvercapMessage(messageAt, 1, 31, 0x1EA13E, calls);
+
+        Assert.Equal(expectedStatus, result.Status.ToString());
+        Assert.Equal((ulong)0, result.ActorID);
+    }
+
+    [Fact]
+    public void OvercapAttributionWithoutInteractionEvidenceIsUnattributed()
+    {
+        var result = DeepDungeonPolicy.CorrelateOvercapMessage(
+            new DateTime(2026, 1, 1, 0, 0, 5, DateTimeKind.Utc), 1, 31, 0x1EA13E, []);
+        Assert.Equal(DeepDungeonPolicy.OvercapAttributionStatus.NoRecentInteraction, result.Status);
+        Assert.Equal(0, result.CandidateCount);
+    }
+
+    [Fact]
+    public void OvercapAttributionRejectsCallsAfterMessageAndHistoryIsBounded()
+    {
+        var messageAt = new DateTime(2026, 1, 1, 0, 0, 5, DateTimeKind.Utc);
+        DeepDungeonInteractionHistory.TreasureCall[] futureCall = [new(123, 0x1EA13E, 1, 31, messageAt.AddMilliseconds(1), 1)];
+        Assert.Equal(DeepDungeonPolicy.OvercapAttributionStatus.ExpiredOrFutureInteraction,
+            DeepDungeonPolicy.CorrelateOvercapMessage(messageAt, 1, 31, 0x1EA13E, futureCall).Status);
+
+        var history = new DeepDungeonInteractionHistory();
+        for (var i = 1; i <= DeepDungeonInteractionHistory.Capacity + 3; ++i)
+            history.RecordTreasureCall((ulong)i, 0x1EA13E, 1, 31, messageAt.AddMilliseconds(i));
+        Assert.Equal(DeepDungeonInteractionHistory.Capacity, history.Snapshot(messageAt.AddMilliseconds(35)).Length);
+        Assert.Empty(history.Snapshot(messageAt.AddSeconds(6)));
+        history.Clear();
+        Assert.Empty(history.Snapshot(messageAt.AddSeconds(6)));
+    }
+
+    [Fact]
     public void PomanderInitializationZerosBecomeBaselineButLaterStockChangesRemainVisible()
     {
         var baselineReady = false;
