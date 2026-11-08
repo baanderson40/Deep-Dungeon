@@ -71,6 +71,7 @@ public sealed unsafe class ActionManagerEx(
     private readonly AutoAutosTweak _autoAutosTweak = new(ws, hints);
 
     private DateTime _nextAllowedExecuteCommand;
+    private readonly Dictionary<uint, string> _pomanderDispatchStates = [];
 
 #nullable disable
     private HookAddress<ActionManager.Delegates.Update> _updateHook;
@@ -374,8 +375,7 @@ public sealed unsafe class ActionManagerEx(
             case ActionType.BozjaHolsterSlot1:
                 return UseBozjaHolsterNative(action);
             case ActionType.Pomander:
-                UsePomanderNative(action);
-                return true;
+                return UsePomanderNative(action);
             case ActionType.Magicite:
                 UseStoneNative(action);
                 return true;
@@ -642,20 +642,45 @@ public sealed unsafe class ActionManagerEx(
         UsePomanderNative(action);
     }
 
-    private void UsePomanderNative(ActionID action)
+    private bool UsePomanderNative(ActionID action)
     {
-        if (_inst->AnimationLock > 0)
-            return;
-
-        var dd = EventFramework.Instance()->GetInstanceContentDeepDungeon();
-        var slot = ws.DeepDungeon.GetPomanderSlot((PomanderID)action.ID);
-        if (dd != null && slot >= 0)
+        var validDungeonAndAction = ws.DeepDungeon.DungeonId != DeepDungeonState.DungeonType.None && action.ID is > 0 and < (uint)PomanderID.Count;
+        var animationLocked = _inst->AnimationLock > 0;
+        InstanceContentDeepDungeon* dd = null;
+        var slot = -1;
+        if (!animationLocked && validDungeonAndAction)
         {
-            var prevRot = GetPlayerRotation();
-            _usePomanderHook.Original(dd, (uint)slot);
-            _inst->AnimationLock = 2.1f;
-            HandleActionRequest(action, 0, 0xE0000000, default, prevRot, GetPlayerRotation());
+            dd = EventFramework.Instance()->GetInstanceContentDeepDungeon();
+            slot = ws.DeepDungeon.GetPomanderSlot((PomanderID)action.ID);
         }
+        var dispatchStatus = DeepDungeonPolicy.GetPomanderDispatchStatus(animationLocked, validDungeonAndAction, dd != null, slot is >= 0 and < DeepDungeonState.NumPomanderSlots);
+        if (dispatchStatus != DeepDungeonPolicy.PomanderDispatchStatus.Issued)
+        {
+            var result = dispatchStatus switch
+            {
+                DeepDungeonPolicy.PomanderDispatchStatus.AnimationLocked => "not issued: animation lock active",
+                DeepDungeonPolicy.PomanderDispatchStatus.InvalidDungeonOrAction => $"not issued: invalid dungeon/action (dungeon={ws.DeepDungeon.DungeonId})",
+                _ => $"not issued: director/slot unavailable (slot={slot})",
+            };
+            LogPomanderDispatch(action, result);
+            return false;
+        }
+
+        var prevRot = GetPlayerRotation();
+        _usePomanderHook.Original(dd, (uint)slot);
+        _inst->AnimationLock = 2.1f;
+        HandleActionRequest(action, 0, 0xE0000000, default, prevRot, GetPlayerRotation());
+        LogPomanderDispatch(action, $"native request issued (slot={slot})");
+        return true;
+    }
+
+    private void LogPomanderDispatch(ActionID action, string state)
+    {
+        var issued = state.StartsWith("native request issued", StringComparison.Ordinal);
+        if (!issued && _pomanderDispatchStates.TryGetValue(action.ID, out var previous) && previous == state)
+            return;
+        _pomanderDispatchStates[action.ID] = state;
+        logger.Debug($"[AMEx] Pomander {action}: {state}; this confirms request dispatch only, not consumption/effect.");
     }
 
     private void UseStoneDetour(InstanceContentDeepDungeon* self, uint slot)

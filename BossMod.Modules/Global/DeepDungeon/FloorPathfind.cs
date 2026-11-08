@@ -21,6 +21,8 @@ internal class FloorPathfind(ReadOnlySpan<RoomFlags> Map)
 
     public List<int> Pathfind(int startRoom, int destRoom)
     {
+        if (Map.Length != Explored.Length || startRoom is < 0 or >= 25 || destRoom is < 0 or >= 25 || Map[startRoom] == RoomFlags.None || Map[destRoom] == RoomFlags.None)
+            return [];
         if (startRoom == destRoom)
             return [];
 
@@ -49,13 +51,13 @@ internal class FloorPathfind(ReadOnlySpan<RoomFlags> Map)
     private IEnumerable<int> Edges(int roomIndex)
     {
         var md = Map[roomIndex];
-        if (md.HasFlag(RoomFlags.ConnectionN))
+        if (roomIndex >= 5 && md.HasFlag(RoomFlags.ConnectionN))
             yield return roomIndex - 5;
-        if (md.HasFlag(RoomFlags.ConnectionS))
+        if (roomIndex < 20 && md.HasFlag(RoomFlags.ConnectionS))
             yield return roomIndex + 5;
-        if (md.HasFlag(RoomFlags.ConnectionW))
+        if (roomIndex % 5 > 0 && md.HasFlag(RoomFlags.ConnectionW))
             yield return roomIndex - 1;
-        if (md.HasFlag(RoomFlags.ConnectionE))
+        if (roomIndex % 5 < 4 && md.HasFlag(RoomFlags.ConnectionE))
             yield return roomIndex + 1;
     }
 }
@@ -90,54 +92,102 @@ abstract partial class AutoClear : ZoneModule
     private int PlayerRoom;
 
     private (int Index, PathfindReason Reason) DesiredRoom;
+    private string? _lastNoPathState;
 
     private void PickARoom(Actor player, AIHints hints)
     {
+        // Manual destination takes precedence over automatic objective selection.
+        if (DesiredRoom.Reason == PathfindReason.Manual)
+            return;
+
         if (DesiredRoom.Reason == PathfindReason.Hunting && (Palace.PassageActive || player.InCombat))
-            DesiredRoom = default;
+            ClearDesiredRoom(Palace.PassageActive ? "passage became active" : "entered combat");
 
         if (DesiredRoom.Reason == PathfindReason.ClosedPassage && Palace.Rooms.Any(r => r.HasFlag(RoomFlags.Passage) && r.HasFlag(RoomFlags.Revealed)))
-            DesiredRoom = default;
+            ClearDesiredRoom("passage was revealed");
+
+        if (DesiredRoom.Reason == PathfindReason.Everything)
+        {
+            var roomFlags = DesiredRoom.Index is >= 0 and < 25 ? Palace.Rooms[DesiredRoom.Index] : RoomFlags.None;
+            var roomActive = roomFlags != RoomFlags.None;
+            var roomRevealed = roomFlags.HasFlag(RoomFlags.Revealed);
+            if (!DeepDungeonPolicy.ShouldKeepFullClearDestination(_config.FullClear, roomActive, roomRevealed))
+                ClearDesiredRoom("full-clear objective no longer pending");
+        }
 
         if (DesiredRoom.Index > 0)
             return;
 
+        if (!TryGetCurrentRoomRects(out var rects, out _))
+            return;
+
+        var destination = default((int Index, PathfindReason Reason));
+        var destinationCause = "";
+        void Consider(int room, PathfindReason reason, string cause, bool objectivePending = true)
+        {
+            var roomActive = room >= 0 && room < Palace.Rooms.Length && Palace.Rooms[room] != RoomFlags.None;
+            var playerInsideRoom = roomActive && rects[room].Contains(player.Position);
+            if (room > 0 && DeepDungeonPolicy.ShouldSelectRoomDestination(roomActive, objectivePending, playerInsideRoom))
+            {
+                destination = (room, reason);
+                destinationCause = cause;
+            }
+        }
+
         if (Palace.PassageActive && !player.InCombat)
-            DesiredRoom = (Array.FindIndex(Palace.Rooms, d => d.HasFlag(RoomFlags.Passage)), PathfindReason.OpenPassage);
+            Consider(Array.FindIndex(Palace.Rooms, d => d.HasFlag(RoomFlags.Passage)), PathfindReason.OpenPassage, "passage active");
 
         if (_config.FullClear)
         {
-            var unexplored = Array.FindIndex(Palace.Rooms, r => r != RoomFlags.None && !r.HasFlag(RoomFlags.Revealed));
-            if (unexplored > 0)
-                DesiredRoom = (unexplored, PathfindReason.Everything);
+            var unexplored = Enumerable.Range(1, Palace.Rooms.Length - 1).FirstOrDefault(i => Palace.Rooms[i] != RoomFlags.None && !Palace.Rooms[i].HasFlag(RoomFlags.Revealed) && !rects[i].Contains(player.Position));
+            Consider(unexplored, PathfindReason.Everything, "full-clear unexplored room");
         }
 
-        if (!Palace.PassageActive && !player.InCombat && hints.PotentialTargets.MinBy(t => (t.Actor.Position - player.Position).LengthSq()) is { } closestMob)
-            DesiredRoom = (FindClosestRoom(closestMob.Actor.Position).Index, PathfindReason.Hunting);
+        if (!Palace.PassageActive && !player.InCombat && hints.PotentialTargets.MinBy(t => (t.Actor.Position - player.Position).LengthSq()) is { } closestMob && TryFindClosestRoom(closestMob.Actor.Position, out var mobRoom))
+        {
+            if (mobRoom.Index != PlayerRoom)
+                Consider(mobRoom.Index, PathfindReason.Hunting, "nearest mob");
+        }
 
-        var unrevealedPassage = Array.FindIndex(Palace.Rooms, d => d.HasFlag(RoomFlags.Passage) && !d.HasFlag(RoomFlags.Revealed));
-        if (unrevealedPassage > 0)
-            DesiredRoom = (unrevealedPassage, PathfindReason.ClosedPassage);
+        var unrevealedPassage = Enumerable.Range(1, Palace.Rooms.Length - 1).FirstOrDefault(i => Palace.Rooms[i].HasFlag(RoomFlags.Passage) && !Palace.Rooms[i].HasFlag(RoomFlags.Revealed) && !rects[i].Contains(player.Position));
+        Consider(unrevealedPassage, PathfindReason.ClosedPassage, "unrevealed passage");
 
         // TODO: figure out if content director has a flag for the candelabra disappearing
-        var unrevealedDevo = Array.FindIndex(Palace.Rooms, d => d.HasFlag((RoomFlags)0x100) && !d.HasFlag(RoomFlags.Revealed));
-        if (unrevealedDevo > 0)
-            DesiredRoom = (unrevealedDevo, PathfindReason.Candelabra);
+        var unrevealedDevo = Enumerable.Range(1, Palace.Rooms.Length - 1).FirstOrDefault(i => Palace.Rooms[i].HasFlag((RoomFlags)0x100) && !Palace.Rooms[i].HasFlag(RoomFlags.Revealed) && !rects[i].Contains(player.Position));
+        Consider(unrevealedDevo, PathfindReason.Candelabra, "unrevealed candelabra");
 
-        if (Palace.Progress.HoardCurrentFloor && World.Actors.FirstOrDefault(a => a.OID == (uint)OID.BandedCofferIndicator) is { } hoard)
-            DesiredRoom = (FindClosestRoom(hoard.Position).Index, PathfindReason.Hoard);
+        if (Palace.Progress.HoardCurrentFloor && World.Actors.FirstOrDefault(a => a.OID == (uint)OID.BandedCofferIndicator) is { } hoard && TryFindClosestRoom(hoard.Position, out var hoardRoom))
+            Consider(hoardRoom.Index, PathfindReason.Hoard, "hoard indicator");
+
+        if (destination.Reason != PathfindReason.Nothing)
+            SetDesiredRoom(destination, destinationCause);
     }
 
     private void HandleFloorPathfind(Actor player, AIHints hints)
     {
+        if (DesiredRoom.Reason == PathfindReason.Nothing)
+            return;
+
+        if (!TryGetCurrentRoomRects(out var rects, out var geometryReason))
+        {
+            LogNoPathState($"geometry:{geometryReason}", $"room navigation unavailable: {geometryReason}");
+            return;
+        }
+        if (DesiredRoom.Index is < 0 or >= 25 || Palace.Rooms[DesiredRoom.Index] == RoomFlags.None || !ValidRoomBox(rects[DesiredRoom.Index]))
+        {
+            LogNoPathState($"destination:{DesiredRoom.Index}", $"invalid destination room {DesiredRoom.Index}");
+            return;
+        }
+
         var slot = Array.FindIndex(Palace.Party, p => p.EntityId == player.InstanceID);
         if (slot < 0)
             return;
 
-        var destRoom = _floorRects[Palace.Progress.Tileset][DesiredRoom.Index];
-        if (destRoom.Contains(player.Position) || DesiredRoom.Index == 0)
+        var destRoom = rects[DesiredRoom.Index];
+        if (destRoom.Contains(player.Position))
         {
-            DesiredRoom = default;
+            LogNoPathState(null, "path available");
+            ClearDesiredRoom("destination room reached");
             return;
         }
 
@@ -146,38 +196,52 @@ abstract partial class AutoClear : ZoneModule
         // player is in a hallway/bridge near destination room, move closer
         if (PlayerRoom == DesiredRoom.Index)
         {
-            hints.GoalZones.Add(p => p.InRect(destRoom.Pos, default(Angle), destRoom.Scale.Z, destRoom.Scale.Z, destRoom.Scale.X) ? goalWeight : 0);
+            LogNoPathState(null, "path available");
+            hints.AddGoalZone(p => p.InRect(destRoom.Pos, default(Angle), destRoom.Scale.Z, destRoom.Scale.Z, destRoom.Scale.X) ? goalWeight : 0, $"deepdungeon-room:{DesiredRoom.Index}:{ReasonReadable(DesiredRoom.Reason)}");
             return;
         }
 
         var path = new FloorPathfind(Palace.Rooms).Pathfind(PlayerRoom, DesiredRoom.Index);
         if (path.Count == 0)
         {
-            Service.Log($"no path from {PlayerRoom} to {DesiredRoom.Index}, doing nothing");
+            LogNoPathState($"{PlayerRoom}:{DesiredRoom.Index}", $"no path from room {PlayerRoom} to {DesiredRoom.Index} ({ReasonReadable(DesiredRoom.Reason)})");
             return;
         }
+        LogNoPathState(null, "path available");
 
-        var destBox = _floorRects[Palace.Progress.Tileset][path[0]];
+        var destBox = rects[path[0]];
         var srcBox = PlayerRoomBox;
 
         var srcToDest = destBox.Pos - srcBox.Pos;
         var srcToDestLen = srcToDest.Length();
+        if (srcToDestLen <= 0.01f)
+            return;
         var playerPos = player.Position;
-        var srcToPlayer = playerPos - srcBox.Pos;
-        var playerProgress = srcToDest.Dot(srcToPlayer) / srcToDestLen;
+        var routeDirection = srcToDest / srcToDestLen;
+        var playerProgress = (playerPos - srcBox.Pos).Dot(routeDirection);
         var srcToDestCardinal = ToCardinal(srcToDest).Sign();
-
         var rectWidth = 10f;
 
-        hints.GoalZones.Add(p =>
+        hints.AddGoalZone(p =>
         {
             // align the near side of the goal rect to the grid since we get annoying jittering otherwise
             if (p.InRect(playerPos, srcToDestCardinal, 10, 100, 100))
                 return 0;
 
-            if (p.InRect(srcBox.Pos, srcToDest.ToAngle(), srcToDestLen, srcToDestLen, rectWidth))
+            if (DeepDungeonPolicy.IsInForwardRoomRoute(p, srcBox.Pos, destBox.Pos, playerProgress, rectWidth))
                 return goalWeight;
             return 0;
-        });
+        }, $"deepdungeon-route:{PlayerRoom}->{DesiredRoom.Index}:{ReasonReadable(DesiredRoom.Reason)}:via={string.Join(">", path)}:src={srcBox.Room}@({srcBox.Pos.X:F1},{srcBox.Pos.Z:F1})±({srcBox.Scale.X:F1},{srcBox.Scale.Z:F1}):next={destBox.Room}@({destBox.Pos.X:F1},{destBox.Pos.Z:F1})±({destBox.Scale.X:F1},{destBox.Scale.Z:F1}):corridor=forward[{playerProgress:F1},{srcToDestLen:F1}],halfWidth={rectWidth:F1},exclusion=player-forward10/back100/halfWidth100");
+    }
+
+    private void LogNoPathState(string? state, string message)
+    {
+        if (_lastNoPathState == state)
+            return;
+        _lastNoPathState = state;
+        if (state != null)
+            Service.Log($"[AutoDD] {message}; dungeon={Palace.DungeonId}, floor={Palace.Floor}.");
+        else if (message == "path available")
+            Service.Log($"[AutoDD] path available again; dungeon={Palace.DungeonId}, floor={Palace.Floor}.");
     }
 }

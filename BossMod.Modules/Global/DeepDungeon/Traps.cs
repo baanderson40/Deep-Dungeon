@@ -8,35 +8,89 @@ abstract partial class AutoClear : ZoneModule
     private readonly List<Vector3> _trapsCurrentZone = [];
     private readonly List<WPos> ProblematicTrapLocations = [];
     private bool _trapsHidden = true;
-    private IpcNotReadyError? _palantirError;
+    private HistoricalTrapInputState _palantirState = HistoricalTrapInputState.Unavailable;
+    private string _palantirStatus = "not queried";
+    private string _palantirFloorStatus = "floor data unavailable";
+    private string? _palantirStateKey;
+    private string? _palantirFloorDiagnosticKey;
+    private string? _palantirError;
+    private string _palantirProvider = "unqueried";
+    private ushort _palantirTerritory;
+    private bool _palantirLoaded;
+    private DateTime _lastPalantirErrorLogAt;
 
     private readonly List<Vector3> _trapsCurrentFloor = [];
 
-    private void FilterTraps()
+    private void FilterTraps(bool reloadProvider = false)
     {
         _trapsCurrentFloor.Clear();
-        if (_trapsCurrentZone.Count == 0 && _palantirListTraps != null)
+        var territory = World.CurrentZone;
+        if (reloadProvider || !_palantirLoaded || _palantirTerritory != territory)
         {
+            _trapsCurrentZone.Clear();
+            _palantirLoaded = true;
+            _palantirTerritory = territory;
             try
             {
-                _trapsCurrentZone.AddRange(_palantirListTraps.InvokeFunc(World.CurrentZone));
-                Service.Log($"collected {_trapsCurrentZone.Count} traps from palantir");
-                _trapsCurrentZone.RemoveAll(t => ProblematicTrapLocations.Any(l => l.AlmostEqual(t.ToWPos(), 0.1f)));
-                _palantirError = null;
+                var fetch = PalantirTrapData.Fetch(
+                    () => _palantirGetTraps.InvokeFunc(territory),
+                    () => _palantirListTraps.InvokeFunc(territory),
+                    error => error is IpcNotReadyError);
+                _palantirProvider = fetch.Provider;
+                if (fetch.Error is { } fetchError)
+                {
+                    _palantirState = fetch.Unavailable ? HistoricalTrapInputState.Unavailable : HistoricalTrapInputState.Error;
+                    _palantirError = PalantirTrapData.ErrorSummary(fetchError);
+                    _palantirStatus = $"provider {(fetch.Unavailable ? "unavailable" : "error")}: provider={fetch.Provider}, territory={territory}";
+                }
+                else
+                {
+                    var input = PalantirTrapData.Process(fetch.Response, t => ProblematicTrapLocations.Any(l => l.AlmostEqual(t.ToWPos(), 0.1f)));
+                    _trapsCurrentZone.AddRange(input.Locations);
+                    _palantirState = input.State;
+                    _palantirError = null;
+                    _palantirStatus = $"{input.State}: provider={fetch.Provider}, territory={territory}, returned={input.Returned}, invalid={input.Invalid}, problematic={input.Problematic}, accepted={input.Accepted}";
+                }
             }
-            catch (IpcNotReadyError err)
+            catch (Exception error)
             {
-                _palantirError = err;
+                _palantirState = HistoricalTrapInputState.Error;
+                _palantirError = PalantirTrapData.ErrorSummary(error);
+                _palantirProvider = "unknown";
+                _palantirStatus = $"provider error: territory={territory}";
             }
+
+            var stateKey = $"{_palantirState}:{_palantirProvider}:{territory}";
+            var isError = _palantirState is HistoricalTrapInputState.Unavailable or HistoricalTrapInputState.Error;
+            if (PalantirTrapData.ShouldLogProviderState(_palantirStateKey, stateKey, isError, _lastPalantirErrorLogAt, World.CurrentTime))
+            {
+                Service.Log($"[AutoDD] Palantir historical trap input: {_palantirStatus}{(_palantirError == null ? "" : $"; error={_palantirError}")}. These are historical candidates, not confirmed active traps.");
+                if (isError)
+                    _lastPalantirErrorLogAt = World.CurrentTime;
+            }
+            _palantirStateKey = stateKey;
         }
 
-        if (Palace.Progress.Tileset >= 0 && Palace.Progress.Tileset < _floorRects.Count)
+        var filteredOut = 0;
+        if (TryGetCurrentRoomRects(out var roomRects, out var geometryReason))
         {
-            for (var i = 0; i < Palace.Rooms.Length; i++)
-                if (Palace.Rooms[i] > 0 && !Palace.Rooms[i].HasFlag(RoomFlags.Home))
-                    _trapsCurrentFloor.AddRange(_trapsCurrentZone.Where(t => _floorRects[Palace.Progress.Tileset][i].Contains(t)));
+            var floorInput = PalantirTrapData.FilterFloor(_trapsCurrentZone, t => Enumerable.Range(0, Palace.Rooms.Length)
+                .Any(i => Palace.Rooms[i] > 0 && !Palace.Rooms[i].HasFlag(RoomFlags.Home) && roomRects[i].Contains(t)));
+            _trapsCurrentFloor.AddRange(floorInput.Locations);
+            filteredOut = floorInput.FilteredOut;
+            _palantirFloorStatus = $"floorAccepted={_trapsCurrentFloor.Count}, floorFiltered={filteredOut}";
+        }
+        else
+            _palantirFloorStatus = $"floor unavailable ({geometryReason})";
+
+        var floorDiagnosticKey = $"{_palantirState}:{territory}:{Palace.DungeonId}:{Palace.Floor}:{_trapsCurrentFloor.Count}:{filteredOut}:{_palantirFloorStatus}";
+        if (_palantirFloorDiagnosticKey != floorDiagnosticKey)
+        {
+            Service.Log($"[AutoDD] Palantir historical trap floor filter: dungeon={Palace.DungeonId}, floor={Palace.Floor}, territory={territory}, state={_palantirState}, {_palantirFloorStatus}. Locations are historical candidates, not confirmed active traps.");
+            _palantirFloorDiagnosticKey = floorDiagnosticKey;
         }
 
+        // Revealed trap actors remain authoritative and independent of Palantir data.
         foreach (var a in World.Actors)
             HandleBeacon(a);
     }
@@ -53,22 +107,26 @@ abstract partial class AutoClear : ZoneModule
 
     private void HandleTrap(Actor actor, ActorCastEvent ev)
     {
-        switch (ev.Action.ID)
+        var trapType = ev.Action.ID switch
         {
-            // standard traps
-            case 6275:
-            case 6276:
-            case 6277:
-            case 6278:
-            case 6279:
+            6275 or 6276 or 6277 or 6278 or 6279 => "standard",
+            11287 => "otter",
+            32375 => "owl",
+            44038 => "fae",
+            _ => null,
+        };
+        if (trapType == null)
+            return;
 
-            case 11287: // otter trap
-            case 32375: // owl trap
-            case 44038: // fae trap
-                var box = FindClosestRoom(actor.Position).Room;
-                _trapsCurrentFloor.RemoveAll(box.Contains);
-                break;
-        }
+        var hasRoom = TryFindClosestRoom(actor.Position, out var room);
+        if (hasRoom)
+            _trapsCurrentFloor.RemoveAll(room.Room.Contains);
+
+        var player = World.Party.Player();
+        var engagedEnemies = World.Actors.Count(a => a.Type == ActorType.Enemy && !a.IsAlly && !a.IsDeadOrDestroyed && (a.InCombat || a.AggroPlayer));
+        _lastTrapActivationAt = World.CurrentTime;
+        _lastTrapActivation = $"{trapType}/action:{ev.Action.ID}/actor:{actor.InstanceID}@({actor.Position.X:F1},{actor.Position.Z:F1})/room:{(hasRoom ? room.Index.ToString() : "?")}";
+        Service.Log($"[AutoDD] trap activation observed: type={trapType}, action={ev.Action.ID}, actor={actor.Name}:{actor.InstanceID}, position=({actor.Position.X:F1},{actor.Position.Z:F1}), room={(hasRoom ? room.Index.ToString() : "?")}, playerPosition={(player != null ? $"({player.Position.X:F1},{player.Position.Z:F1})" : "unknown")}, engagedEnemies={engagedEnemies}; event confirms trap action, not trap cause of aggro/death.");
     }
 
     private void HandleBeacon(Actor c)

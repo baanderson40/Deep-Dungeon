@@ -20,6 +20,7 @@ public class ThetaStar
     {
         public float GScore;
         public float HScore;
+        public float Priority;
         public int ParentIndex;
         public int OpenHeapIndex; // -1 if in closed list, 0 if not in any lists, otherwise (index+1)
         public float PathLeeway; // min diff along path between node's g-value and cell's g-value
@@ -53,6 +54,22 @@ public class ThetaStar
     public ref Node NodeByIndex(int index) => ref _nodes[index];
     public WPos CellCenter(int index) => _map.GridToWorld(index % _map.Width, index / _map.Width, 0.5f, 0.5f);
 
+    public (int VisitedGoalCells, int VisitedMaxPriorityCells) CountVisitedGoalCells()
+    {
+        var visitedGoalCells = 0;
+        var visitedMaxPriorityCells = 0;
+        var numPixels = _map.Width * _map.Height;
+        for (var i = 0; i < numPixels; ++i)
+        {
+            if (_nodes[i].OpenHeapIndex == 0 || _map.PixelPriority[i] <= 0)
+                continue;
+            ++visitedGoalCells;
+            if (_map.PixelPriority[i] == _map.MaxPriority)
+                ++visitedMaxPriorityCells;
+        }
+        return (visitedGoalCells, visitedMaxPriorityCells);
+    }
+
     // gMultiplier is typically inverse speed, which turns g-values into time
     public void Start(Map map, WPos startPos, float gMultiplier)
     {
@@ -84,6 +101,7 @@ public class ThetaStar
         {
             GScore = 0,
             HScore = startNode.HScore, //HeuristicDistance(start.x, start.y),
+            Priority = _map.PixelPriority[StartNodeIndex],
             ParentIndex = StartNodeIndex, // start's parent is self
             PathLeeway = _startMaxG,
             PathMinG = _startMaxG,
@@ -230,6 +248,14 @@ public class ThetaStar
         if (nodeL.Score != nodeR.Score)
             return nodeL.Score > nodeR.Score ? -2 : +2;
 
+        // Within the same safety class, prefer a destination with greater rasterized goal value
+        // before optimizing travel cost. Otherwise tiny changes in the starting cell can make
+        // a low-value nearby point tie with (and beat) the actual higher-value destination.
+        if (nodeL.Priority > nodeR.Priority + 0.00001f)
+            return -2;
+        else if (nodeR.Priority > nodeL.Priority + 0.00001f)
+            return +2;
+
         // TODO: should we use leeway here or distance?..
         //return nodeL.PathLeeway > nodeR.PathLeeway;
         var gl = nodeL.GScore;
@@ -344,6 +370,7 @@ public class ThetaStar
         {
             GScore = destGScore,
             HScore = destNode.HScore,
+            Priority = _map.PixelPriority[nodeIndex],
             ParentIndex = parentIndex,
             OpenHeapIndex = destNode.OpenHeapIndex,
             PathLeeway = destLeeway,

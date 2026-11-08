@@ -22,6 +22,8 @@ public struct NavigationDecision
 
     public WPos? Destination;
     public WPos? NextWaypoint;
+    public WPos? PathfindDestination;
+    public WPos? SearchGoalPosition;
     //public float NextTurn; // > 0 if we turn left after reaching first waypoint, < 0 if we turn right, 0 otherwise (no more waypoints)
     public float LeewaySeconds; // can be used for finishing casts / slidecasting etc.
     public float TimeToGoal;
@@ -29,6 +31,16 @@ public struct NavigationDecision
     public TimeSpan RasterizeTime;
     public TimeSpan PathfindTime;
     public TimeSpan TotalTime;
+    public string? PathfindDiagnostic;
+    public DateTime PathfindDiagnosticAt;
+    public long Sequence;
+    public DateTime RequestedAt;
+    public WPos RequestedPosition;
+    public float RequestedHeightY;
+    public double BuildDurationMs;
+    public double DiagnosticDurationMs;
+    public DateTime BuildCompletedAt;
+    public DateTime DiagnosticCompletedAt;
 
     public const float CushionDepriority = 0.5f; // should be lower than any priority specifically added by rotation modules
 
@@ -40,7 +52,7 @@ public struct NavigationDecision
     //  - sending position update packet (not an option, can't be done in the vanilla client, so it doesn't match our philosophy)
     public static float CushionFromRTT(float rtt) => rtt + 0.5f + ActorCastInfo.NPCFinishDelay;
 
-    public static NavigationDecision Build(Context ctx, DateTime currentTime, AIHints hints, WPos playerPosition, float playerSpeed, float rtt, float spaceCushion, bool useOldRasterizer = false)
+    public static NavigationDecision Build(Context ctx, DateTime currentTime, AIHints hints, WPos playerPosition, float playerSpeed, float rtt, float spaceCushion, bool useOldRasterizer = false, bool collectDiagnostics = false, long sequence = 0, float requestedHeightY = 0, WPos? comparisonGoal = null)
     {
         var startTime = DateTime.Now;
 
@@ -71,10 +83,13 @@ public struct NavigationDecision
         ref var bestNode = ref ctx.ThetaStar.NodeByIndex(bestNodeIndex);
         var waypoints = GetFirstWaypoints(ctx.ThetaStar, ctx.Map, bestNodeIndex, playerPosition);
         var finishTime = DateTime.Now;
-        return new NavigationDecision() { Destination = waypoints.first, NextWaypoint = waypoints.second, LeewaySeconds = bestNode.PathLeeway, TimeToGoal = bestNode.GScore, PathfindTime = finishTime - rasterFinish, RasterizeTime = rasterFinish - startTime, TotalTime = finishTime - startTime };
+        var searchGoalPosition = ctx.ThetaStar.CellCenter(bestNodeIndex);
+        var diagnostic = collectDiagnostics ? BuildPathfindDiagnostic(ctx, hints, playerPosition, requestedHeightY, waypoints.first, searchGoalPosition, comparisonGoal, currentTime, emergencyMode, bestNodeIndex) : null;
+        var diagnosticFinish = DateTime.Now;
+        return new NavigationDecision() { Destination = waypoints.first, NextWaypoint = waypoints.second, PathfindDestination = waypoints.first, SearchGoalPosition = searchGoalPosition, LeewaySeconds = bestNode.PathLeeway, TimeToGoal = bestNode.GScore, PathfindTime = finishTime - rasterFinish, RasterizeTime = rasterFinish - startTime, TotalTime = finishTime - startTime, PathfindDiagnostic = diagnostic, PathfindDiagnosticAt = collectDiagnostics ? currentTime : default, Sequence = sequence, RequestedAt = currentTime, RequestedPosition = playerPosition, RequestedHeightY = requestedHeightY, BuildDurationMs = (finishTime - startTime).TotalMilliseconds, DiagnosticDurationMs = (diagnosticFinish - finishTime).TotalMilliseconds, BuildCompletedAt = finishTime, DiagnosticCompletedAt = diagnosticFinish };
     }
 
-    public static Task<NavigationDecision> BuildAsync(Context ctx, DateTime currentTime, AIHints hints, WPos playerPos, float playerSpeed, float rtt, float spaceCushion)
+    public static Task<NavigationDecision> BuildAsync(Context ctx, DateTime currentTime, AIHints hints, WPos playerPos, float playerSpeed, float rtt, float spaceCushion, bool collectDiagnostics = false, long sequence = 0, float requestedHeightY = 0, WPos? comparisonGoal = null)
     {
         var hintsCopy = new AIHints()
         {
@@ -85,8 +100,155 @@ public struct NavigationDecision
             Portals = [.. hints.Portals],
             ForbiddenZones = [.. hints.ForbiddenZones],
             GoalZones = [.. hints.GoalZones],
+            GoalZoneOwners = [.. hints.GoalZoneOwners],
         };
-        return Task.Run(() => Build(ctx, currentTime, hintsCopy, playerPos, playerSpeed, rtt, spaceCushion));
+        return Task.Run(() => Build(ctx, currentTime, hintsCopy, playerPos, playerSpeed, rtt, spaceCushion, collectDiagnostics: collectDiagnostics, sequence: sequence, requestedHeightY: requestedHeightY, comparisonGoal: comparisonGoal));
+    }
+
+    private static string BuildPathfindDiagnostic(Context ctx, AIHints hints, WPos playerPosition, float playerHeightY, WPos? firstWaypoint, WPos searchGoalPosition, WPos? comparisonGoal, DateTime currentTime, bool emergencyMode, int bestNodeIndex)
+    {
+        var map = ctx.Map;
+        var startGridRaw = map.WorldToGrid(playerPosition);
+        var startInBounds = map.InBounds(startGridRaw.x, startGridRaw.y);
+        var startIndex = ctx.ThetaStar.StartNodeIndex;
+        var startGrid = map.IndexToGrid(startIndex);
+        var startMaxG = map.PixelMaxG[startIndex];
+        var startPriority = map.PixelPriority[startIndex];
+        var positivePriorityCells = 0;
+        var safePriorityCells = 0;
+        var reachablePriorityCells = 0;
+        var reachableMaxPriorityCells = 0;
+        var blockedCells = 0;
+
+        var numPixels = map.Width * map.Height;
+        for (var i = 0; i < numPixels; ++i)
+        {
+            var maxG = map.PixelMaxG[i];
+            if (maxG != float.MaxValue)
+                ++blockedCells;
+            var priority = map.PixelPriority[i];
+            if (priority <= 0)
+                continue;
+            ++positivePriorityCells;
+            if (maxG == float.MaxValue)
+                ++safePriorityCells;
+            if (ctx.ThetaStar.NodeByIndex(i).OpenHeapIndex != 0)
+            {
+                ++reachablePriorityCells;
+                if (priority == map.MaxPriority)
+                    ++reachableMaxPriorityCells;
+            }
+        }
+
+        var visited = ctx.ThetaStar.CountVisitedGoalCells();
+        var goalCoverage = new List<string>(Math.Min(hints.GoalZones.Count, 8));
+        string Owner(int index) => hints.GoalZoneOwners.FirstOrDefault(o => o.goalIndex == index).owner ?? "unknown";
+        for (var zoneIndex = 0; zoneIndex < Math.Min(hints.GoalZones.Count, 8); ++zoneIndex)
+        {
+            var zone = hints.GoalZones[zoneIndex];
+            var covered = 0;
+            var maxScore = 0f;
+            foreach (var (_, _, point) in map.EnumeratePixels())
+            {
+                var score = zone(point);
+                if (score > 0)
+                    ++covered;
+                maxScore = MathF.Max(maxScore, score);
+            }
+            var selectedScore = zone(searchGoalPosition);
+            var priorScore = comparisonGoal is { } prior ? zone(prior) : float.NaN;
+            goalCoverage.Add($"{zoneIndex}/{Owner(zoneIndex)}:{covered}/{numPixels}@{maxScore:F2}/winner:{selectedScore:F3}/prior:{(comparisonGoal == null ? "n/a" : priorScore.ToString("F3"))}");
+        }
+
+        var forbiddenCoverage = new List<string>(Math.Min(hints.ForbiddenZones.Count, 8));
+        for (var zoneIndex = 0; zoneIndex < Math.Min(hints.ForbiddenZones.Count, 8); ++zoneIndex)
+        {
+            var zone = hints.ForbiddenZones[zoneIndex];
+            var covered = 0;
+            foreach (var (_, _, point) in map.EnumeratePixels())
+                if (zone.shape.Check(point))
+                    ++covered;
+            forbiddenCoverage.Add($"{zoneIndex}/src{zone.tag}:{covered}/{numPixels}");
+        }
+
+        var bestGrid = map.IndexToGrid(bestNodeIndex);
+        var bestNode = ctx.ThetaStar.NodeByIndex(bestNodeIndex);
+        var bestPos = ctx.ThetaStar.CellCenter(bestNodeIndex);
+        var comparison = DescribeCandidateComparison(ctx, comparisonGoal, bestNodeIndex);
+        var segment = DescribeFirstSegment(map, hints, playerPosition, firstWaypoint, currentTime);
+        static string FormatG(float g) => g == float.MaxValue ? "safe" : g == float.MinValue ? "blocked" : g.ToString("F2");
+        return $"pathTrace(at={currentTime:HH:mm:ss.fff},playerXZ=({playerPosition.X:F1},{playerPosition.Z:F1}),playerY={playerHeightY:F2},hints={hints.GoalZones.Count}goals/{hints.ForbiddenZones.Count}forbidden,map=center({map.Center.X:F1},{map.Center.Z:F1}),size={map.Width}x{map.Height}@{map.Resolution:F2},rotation={map.Rotation.Deg:F1},bounds={map.MinX}:{map.MinY}-{map.MaxX}:{map.MaxY},start=raw{startGridRaw}/inBounds:{startInBounds}/used{startGrid}/maxG:{FormatG(startMaxG)}/prio:{startPriority:F2},emergency={emergencyMode},constrained={blockedCells}/{numPixels},goalPixels={positivePriorityCells}/safe:{safePriorityCells}/maxPrio:{map.MaxPriority:F2},goalCoverage=[{string.Join(",", goalCoverage)}]{(hints.GoalZones.Count > goalCoverage.Count ? ",..." : "")},forbiddenCoverage=[{string.Join(",", forbiddenCoverage)}]{(hints.ForbiddenZones.Count > forbiddenCoverage.Count ? ",..." : "")},segment={segment},search(steps={ctx.ThetaStar.NumSteps},visitedGoals={visited.VisitedGoalCells}/{reachablePriorityCells},visitedMax={visited.VisitedMaxPriorityCells}/{reachableMaxPriorityCells},best=({bestGrid.x},{bestGrid.y})@({bestPos.X:F1},{bestPos.Z:F1}),score={bestNode.Score},g={bestNode.GScore:F2},h={bestNode.HScore:F2},leeway={FormatG(bestNode.PathLeeway)},startScore={ctx.ThetaStar.NodeByIndex(startIndex).Score}),{comparison}).";
+    }
+
+    private static string DescribeCandidateComparison(Context ctx, WPos? comparisonGoal, int bestNodeIndex)
+    {
+        if (comparisonGoal is not { } prior)
+            return "paired=none";
+        var map = ctx.Map;
+        var raw = map.WorldToGrid(prior);
+        if (!map.InBounds(raw.x, raw.y))
+            return $"paired(prior=({prior.X:F1},{prior.Z:F1}),status=outside-map,winner={bestNodeIndex})";
+        var priorIndex = map.GridToIndex(raw);
+        var winnerNode = ctx.ThetaStar.NodeByIndex(bestNodeIndex);
+        var priorNode = ctx.ThetaStar.NodeByIndex(priorIndex);
+        var priorOpen = priorNode.OpenHeapIndex != 0;
+        var winnerOpen = winnerNode.OpenHeapIndex != 0;
+        var priority = map.PixelPriority[priorIndex];
+        var maxG = map.PixelMaxG[priorIndex];
+        var priorStatus = priorOpen ? "evaluated" : "not-evaluated";
+        var comparison = priorOpen && winnerOpen ? ctx.ThetaStar.CompareNodeScores(ref priorNode, ref winnerNode).ToString() : "not-comparable";
+        return $"paired(prior=({prior.X:F1},{prior.Z:F1})/cell:{raw.x}:{raw.y}/status:{priorStatus}/priority:{priority:F3}/maxG:{maxG:F2}/score:{(priorOpen ? priorNode.Score.ToString() : "n/a")}/g:{(priorOpen ? priorNode.GScore.ToString("F2") : "n/a")}/h:{(priorOpen ? priorNode.HScore.ToString("F2") : "n/a")},winner=cell:{map.IndexToGrid(bestNodeIndex)}/status:{(winnerOpen ? "evaluated" : "not-evaluated")}/priority:{map.PixelPriority[bestNodeIndex]:F3}/score:{winnerNode.Score}/g:{winnerNode.GScore:F2}/h:{winnerNode.HScore:F2},compareNodeScores={comparison}; negative means prior candidate ranks better, positive means winner ranks better; ranking=safety-class then higher goal priority then G+H then larger G tie-break)";
+    }
+
+    private static string DescribeFirstSegment(Map map, AIHints hints, WPos start, WPos? waypoint, DateTime currentTime)
+    {
+        if (waypoint is not { } end)
+            return "none";
+        var from = map.WorldToGrid(start);
+        var to = map.WorldToGrid(end);
+        var checkedCells = 0;
+        var constrained = 0;
+        var firstConstrained = "none";
+        var firstForbidden = "none";
+        var firstTemporaryObstacle = "none";
+        var outside = false;
+        foreach (var cell in map.EnumeratePixelsInLine(from.x, from.y, to.x, to.y))
+        {
+            if (++checkedCells > 1024)
+                break;
+            if (!map.InBounds(cell.x, cell.y))
+            {
+                outside = true;
+                if (firstConstrained == "none")
+                    firstConstrained = $"outOfBounds@{cell.x}:{cell.y}";
+                continue;
+            }
+            var g = map.PixelMaxG[map.GridToIndex(cell.x, cell.y)];
+            var point = map.GridToWorld(cell.x, cell.y, 0.5f, 0.5f);
+            if (firstForbidden == "none")
+                for (var i = 0; i < hints.ForbiddenZones.Count; ++i)
+                {
+                    var zone = hints.ForbiddenZones[i];
+                    if (zone.shape.Check(point))
+                    {
+                        firstForbidden = $"{i}/src:{zone.tag}/activeIn:{(zone.activation - currentTime).TotalSeconds:F1}s";
+                        break;
+                    }
+                }
+            if (firstTemporaryObstacle == "none")
+                for (var i = 0; i < hints.TemporaryObstacles.Count; ++i)
+                    if (hints.TemporaryObstacles[i].Check(point))
+                    {
+                        firstTemporaryObstacle = i.ToString();
+                        break;
+                    }
+            if (g == float.MaxValue)
+                continue;
+            ++constrained;
+            if (firstConstrained == "none")
+                firstConstrained = $"{cell.x}:{cell.y}/g:{(g == float.MinValue ? "blocked" : g <= -900 ? $"static:{g:F0}" : g <= 0 ? $"immediate:{g:F2}" : $"timeLimited:{g:F2}")}";
+        }
+        return $"from={from.x}:{from.y},to={to.x}:{to.y},sampler=bresenham-grid-centers,cells={checkedCells},constrained={constrained},outside={outside},bresenhamFirst={firstConstrained},forbidden={firstForbidden},temporaryObstacle={firstTemporaryObstacle},note=conservative raster sample; diagonal corner side-cell is not proof solver LOS is blocked";
     }
 
     public static void RasterizeForbiddenZones(Map map, WPos playerPos, List<(Sdf distance, DateTime activation, ulong source)> zones, DateTime current, List<float> gScratch, BitArray dScratch, float rtt, float cushion)

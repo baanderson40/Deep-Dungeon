@@ -139,6 +139,19 @@ public sealed class AIHints
     // guideline: rotation modules should return 1 if it would use single-target action from that spot, 2 if it is also a positional, 3 if it would use aoe that would hit minimal viable number of targets, +1 for each extra target
     // other parts of the code can return small (e.g. 0.01) values to slightly (de)prioritize some positions, or large (e.g. 1000) values to effectively soft-override target position (but still utilize pathfinding)
     public List<Func<WPos, float>> GoalZones = [];
+    // Diagnostic-only ownership tags. Indices refer to GoalZones and do not participate in scoring.
+    public List<(int goalIndex, string owner)> GoalZoneOwners = [];
+
+    // Diagnostic-only request for a pathfinding snapshot; does not affect movement or goal scoring.
+    public string? DeepDungeonDiagnosticRequest;
+
+    public void AddGoalZone(Func<WPos, float> goal, string? diagnosticOwner = null)
+    {
+        var index = GoalZones.Count;
+        GoalZones.Add(goal);
+        if (diagnosticOwner != null)
+            GoalZoneOwners.Add((index, diagnosticOwner));
+    }
 
     public class TempObstaclesList : List<Sdf>
     {
@@ -214,6 +227,8 @@ public sealed class AIHints
         InteractWithTarget = null;
         ForbiddenZones.Clear();
         GoalZones.Clear();
+        GoalZoneOwners.Clear();
+        DeepDungeonDiagnosticRequest = null;
         Voidzones.Clear();
         TemporaryObstacles.Clear();
         Portals.Clear();

@@ -21,6 +21,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "benchmarks", "benchmarks\be
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BossMod.Modules", "BossMod.Modules\BossMod.Modules.csproj", "{CCA3AB1B-650A-55C4-75FB-E1FDBAEE4285}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BossMod.Tests", "BossMod.Tests\BossMod.Tests.csproj", "{5E6A64EE-4CB8-4A1F-B72C-9C267050A0C8}"
+EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BossMod.Autorotation", "BossMod.Autorotation\BossMod.Autorotation.csproj", "{6BD242AF-CFF4-4ADD-BC06-E57734BB84DD}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BossMod.Ultimate", "BossMod.Ultimate\BossMod.Ultimate.csproj", "{DD8F6062-BF8A-4ADB-055B-31C4FD16A153}"
@@ -56,6 +58,10 @@ Global
 		{CCA3AB1B-650A-55C4-75FB-E1FDBAEE4285}.Debug|AnyCPU.Build.0 = Debug|x64
 		{CCA3AB1B-650A-55C4-75FB-E1FDBAEE4285}.Release|AnyCPU.ActiveCfg = Release|x64
 		{CCA3AB1B-650A-55C4-75FB-E1FDBAEE4285}.Release|AnyCPU.Build.0 = Release|x64
+		{5E6A64EE-4CB8-4A1F-B72C-9C267050A0C8}.Debug|AnyCPU.ActiveCfg = Debug|Any CPU
+		{5E6A64EE-4CB8-4A1F-B72C-9C267050A0C8}.Debug|AnyCPU.Build.0 = Debug|Any CPU
+		{5E6A64EE-4CB8-4A1F-B72C-9C267050A0C8}.Release|AnyCPU.ActiveCfg = Release|Any CPU
+		{5E6A64EE-4CB8-4A1F-B72C-9C267050A0C8}.Release|AnyCPU.Build.0 = Release|Any CPU
 		{6BD242AF-CFF4-4ADD-BC06-E57734BB84DD}.Debug|AnyCPU.ActiveCfg = Debug|x64
 		{6BD242AF-CFF4-4ADD-BC06-E57734BB84DD}.Debug|AnyCPU.Build.0 = Debug|x64
 		{6BD242AF-CFF4-4ADD-BC06-E57734BB84DD}.Release|AnyCPU.ActiveCfg = Release|x64

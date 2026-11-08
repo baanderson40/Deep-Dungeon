@@ -72,7 +72,7 @@ public class DeepDungeonAI(RotationModuleManager manager, Actor player) : AIBase
 
         if (IsRanged && !Player.InCombat && primaryTarget is Actor target && !target.InCombat && !target.IsAlly)
             // bandaid fix to help deal with constant LOS issues
-            Hints.GoalZones.Add(Hints.GoalSingleTarget(target, Player, World.Actors, 3, 0.1f));
+            Hints.AddGoalZone(Hints.GoalSingleTarget(target, Player, World.Actors, 3, 0.1f), $"deepdungeon-ranged-target:{target.InstanceID}");
 
         SetupKiteZone(strategy, primaryTarget);
 

@@ -33,7 +33,7 @@ abstract partial class AutoClear : ZoneModule
         var playerSlot = Array.FindIndex(Palace.Party, p => p.EntityId == player?.InstanceID);
         var targetRoom = DrawMap(player, playerSlot);
         if (targetRoom >= 0)
-            DesiredRoom = (targetRoom, PathfindReason.Manual);
+            SetDesiredRoom((targetRoom, PathfindReason.Manual), "manual minimap selection");
 
         using (ImRaii.Disabled(true))
         {
@@ -50,11 +50,12 @@ abstract partial class AutoClear : ZoneModule
         if (Service.IsDev && MostInterestingObject is { } obj)
             Service.Camera.AddLine(player?.PosRot.XYZ() ?? default, obj.Actor.PosRot.XYZ(), ArenaColor.Danger, 2, false);
 
+        ImGui.Text($"Palantir historical candidates: {_palantirStatus}; {_palantirFloorStatus}");
         if (_palantirError != null)
         {
-            ImGui.Text("Couldn't connect to Palantir. Trap locations will not be displayed.");
+            ImGui.Text($"Historical trap input unavailable; revealed traps remain active. {_palantirError}");
             if (ImGui.Button("Retry"))
-                FilterTraps();
+                FilterTraps(reloadProvider: true);
         }
 
         var maxPull = _config.MaxPull;
@@ -70,8 +71,7 @@ abstract partial class AutoClear : ZoneModule
 
         if (ImGui.Button("Reload traps"))
         {
-            _trapsCurrentZone.Clear();
-            FilterTraps();
+            FilterTraps(reloadProvider: true);
         }
     }
 }

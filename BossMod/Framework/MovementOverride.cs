@@ -22,6 +22,26 @@ public sealed unsafe class MovementOverride(
     Camera camera
 ) : IMovementOverride, IHostedService, IDisposable
 {
+    public readonly record struct DiagnosticSnapshot(
+        long SampleAtMilliseconds,
+        Vector3? DesiredDirection,
+        WDir UserMove,
+        WDir ActualMove,
+        WDir FinalOutput,
+        byte AdditiveInput,
+        bool InputEnabled1,
+        bool InputEnabled2,
+        bool MovementAllowed,
+        bool MovementBlocked,
+        bool FollowPathActive,
+        bool Misdirection,
+        bool InteractionMovementSuppressed,
+        ulong InteractionTargetID,
+        long InteractionSampleAtMilliseconds,
+        long HookCalls,
+        long NonzeroOutputs,
+        long ZeroOutputs);
+
     public Vector3? DesiredDirection { get; set; }
     public Angle MisdirectionThreshold { get; set; }
     public Angle? DesiredSpinDirection { get; set; }
@@ -33,6 +53,37 @@ public sealed unsafe class MovementOverride(
     private bool? _forcedControlState;
     private bool _legacyMode;
     private bool[]? _navmeshPathIsRunning;
+    private long _lastMovementSampleAt;
+    private Vector3? _lastDesiredDirection;
+    private WDir _lastUserMove;
+    private WDir _lastActualMove;
+    private WDir _lastFinalOutput;
+    private bool _lastMovementAllowed;
+    private byte _lastAdditiveInput;
+    private bool _lastInputEnabled1;
+    private bool _lastInputEnabled2;
+    private bool _lastMovementBlocked;
+    private bool _lastFollowPathActive;
+    private bool _lastMisdirection;
+    private bool _interactionMovementSuppressed;
+    private ulong _interactionTargetID;
+    private long _interactionSampleAtMilliseconds;
+    private long _hookCalls;
+    private long _nonzeroOutputs;
+    private long _zeroOutputs;
+
+    public DiagnosticSnapshot ReadDiagnosticSnapshot() => new(
+        Interlocked.Read(ref _lastMovementSampleAt), _lastDesiredDirection, _lastUserMove, _lastActualMove, _lastFinalOutput,
+        _lastAdditiveInput, _lastInputEnabled1, _lastInputEnabled2, _lastMovementAllowed, _lastMovementBlocked, _lastFollowPathActive, _lastMisdirection,
+        _interactionMovementSuppressed, _interactionTargetID, Interlocked.Read(ref _interactionSampleAtMilliseconds),
+        Interlocked.Read(ref _hookCalls), Interlocked.Read(ref _nonzeroOutputs), Interlocked.Read(ref _zeroOutputs));
+
+    public void RecordInteractionMovementSuppression(bool suppressed, ulong targetID)
+    {
+        _interactionMovementSuppressed = suppressed;
+        _interactionTargetID = targetID;
+        Interlocked.Exchange(ref _interactionSampleAtMilliseconds, Environment.TickCount64);
+    }
 
     public bool IsMoving() => ActualMove != default;
     public bool IsMoveRequested() => UserMove != default;
@@ -130,7 +181,10 @@ public sealed unsafe class MovementOverride(
         }
 
         // TODO: we really need to introduce some extra checks that PlayerMoveController::readInput does - sometimes it skips reading input, and returning something non-zero breaks stuff...
-        var movementAllowed = bAdditiveUnk == 0 && _rmiWalkIsInputEnabled1(self) && _rmiWalkIsInputEnabled2(self) && !FollowPathActive();
+        var followPathActive = FollowPathActive();
+        var inputEnabled1 = _rmiWalkIsInputEnabled1(self);
+        var inputEnabled2 = _rmiWalkIsInputEnabled2(self);
+        var movementAllowed = bAdditiveUnk == 0 && inputEnabled1 && inputEnabled2 && !followPathActive;
         var misdirectionMode = PlayerHasMisdirection();
         if (!movementAllowed && misdirectionMode)
         {
@@ -177,6 +231,23 @@ public sealed unsafe class MovementOverride(
             : _forcedControlState == null ? ActualMove // misdirection mode, but we're not trying to help user
             : _forcedControlState.Value ? ActualMove // misdirection mode, not moving yet, but want to start - can return anything really
             : default; // misdirection mode, not moving yet and don't want to
+        _lastDesiredDirection = DesiredDirection;
+        _lastUserMove = UserMove;
+        _lastActualMove = ActualMove;
+        _lastFinalOutput = output;
+        _lastAdditiveInput = bAdditiveUnk;
+        _lastInputEnabled1 = inputEnabled1;
+        _lastInputEnabled2 = inputEnabled2;
+        _lastMovementAllowed = movementAllowed;
+        _lastMovementBlocked = MovementBlocked;
+        _lastFollowPathActive = followPathActive;
+        _lastMisdirection = misdirectionMode;
+        Interlocked.Exchange(ref _lastMovementSampleAt, Environment.TickCount64);
+        Interlocked.Increment(ref _hookCalls);
+        if (output != default)
+            Interlocked.Increment(ref _nonzeroOutputs);
+        else
+            Interlocked.Increment(ref _zeroOutputs);
         *sumLeft = output.X;
         *sumForward = output.Z;
     }

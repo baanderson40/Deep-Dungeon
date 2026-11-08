@@ -21,6 +21,7 @@ public sealed class RotationModuleManager : IDisposable
     public readonly AutorotationConfig Config = Service.Config.Get<AutorotationConfig>();
     public readonly RotationDatabase Database;
     public readonly BossModuleManager Bossmods;
+    private readonly MovementOverride? _movementOverride;
     public int PlayerSlot; // TODO: reconsider, we rely on too many things in clientstate...
     public readonly AIHints Hints;
     public PlanExecution? Planner { get; private set; }
@@ -43,6 +44,7 @@ public sealed class RotationModuleManager : IDisposable
     public WorldState WorldState => Bossmods.WorldState;
     public ulong PlayerInstanceId => WorldState.Party.Members[PlayerSlot].InstanceId;
     public Actor? Player => WorldState.Party[PlayerSlot];
+    public MovementOverride.DiagnosticSnapshot? MovementDiagnostic => _movementOverride?.ReadDiagnosticSnapshot();
 
     // historic data for recent events that could be interesting for modules
     public DateTime CombatStart { get; private set; } // default value when player is not in combat, otherwise timestamp when player entered combat
@@ -80,10 +82,11 @@ public sealed class RotationModuleManager : IDisposable
 
     public static bool IsTransformStatus(ActorStatus st) => TransformationStatuses.Contains(st.ID);
 
-    public RotationModuleManager(RotationDatabase db, BossModuleManager bmm, AIHints hints, int playerSlot = PartyState.PlayerSlot)
+    public RotationModuleManager(RotationDatabase db, BossModuleManager bmm, AIHints hints, int playerSlot = PartyState.PlayerSlot, MovementOverride? movementOverride = null)
     {
         Database = db;
         Bossmods = bmm;
+        _movementOverride = movementOverride;
         PlayerSlot = playerSlot;
         Hints = hints;
         _subscriptions = new
