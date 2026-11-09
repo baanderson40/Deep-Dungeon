@@ -186,16 +186,6 @@ abstract partial class AutoClear : ZoneModule
         Service.Log($"[AutoDD] room geometry {(ready ? "ready" : "unavailable")}: dungeon={Palace.DungeonId}, floor={Palace.Floor}, territory={World.CurrentZone}, tileset={tileset}, activeRooms={Palace.Rooms.Count(room => room != RoomFlags.None)}, layouts={_floorRects.Count}, detail={reason}.");
     }
 
-    private static WDir ToCardinal(WDir x)
-    {
-        var abs = x.Abs();
-        if (abs.X < abs.Z)
-            x.X = 0;
-        else
-            x.Z = 0;
-        return x;
-    }
-
     private float DistanceBox2D(WPos p, Vector2 rectMin, Vector2 rectMax)
     {
         var dx = MathF.Max(MathF.Max(rectMin.X - p.X, 0), p.X - rectMax.X);

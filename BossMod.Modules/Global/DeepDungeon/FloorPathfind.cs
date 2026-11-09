@@ -115,10 +115,29 @@ abstract partial class AutoClear : ZoneModule
                 ClearDesiredRoom("full-clear objective no longer pending");
         }
 
-        if (DesiredRoom.Index > 0)
+        if (!TryGetCurrentRoomRects(out var rects, out _))
             return;
 
-        if (!TryGetCurrentRoomRects(out var rects, out _))
+        // Once the hoard is revealed, keep it as the floor objective until collected.
+        // Otherwise passage/full-clear selection can pull us away, then the still-present
+        // indicator selects the hoard room again and creates a room-objective loop.
+        if (Palace.Progress.HoardCurrentFloor
+            && World.Actors.FirstOrDefault(a => a.OID == (uint)OID.BandedCofferIndicator) is { } activeHoard
+            && TryFindClosestRoom(activeHoard.Position, out var activeHoardRoom))
+        {
+            if (DesiredRoom.Reason is not (PathfindReason.Nothing or PathfindReason.Hoard))
+                ClearDesiredRoom("hoard objective takes priority");
+            if (DesiredRoom.Reason == PathfindReason.Nothing)
+            {
+                var roomActive = activeHoardRoom.Index > 0 && activeHoardRoom.Index < Palace.Rooms.Length && Palace.Rooms[activeHoardRoom.Index] != RoomFlags.None;
+                var playerInsideRoom = roomActive && rects[activeHoardRoom.Index].Contains(player.Position);
+                if (DeepDungeonPolicy.ShouldSelectRoomDestination(roomActive, true, playerInsideRoom))
+                    SetDesiredRoom((activeHoardRoom.Index, PathfindReason.Hoard), "hoard indicator");
+            }
+            return;
+        }
+
+        if (DesiredRoom.Index > 0)
             return;
 
         var destination = default((int Index, PathfindReason Reason));
@@ -219,19 +238,10 @@ abstract partial class AutoClear : ZoneModule
         var playerPos = player.Position;
         var routeDirection = srcToDest / srcToDestLen;
         var playerProgress = (playerPos - srcBox.Pos).Dot(routeDirection);
-        var srcToDestCardinal = ToCardinal(srcToDest).Sign();
         var rectWidth = 10f;
 
-        hints.AddGoalZone(p =>
-        {
-            // align the near side of the goal rect to the grid since we get annoying jittering otherwise
-            if (p.InRect(playerPos, srcToDestCardinal, 10, 100, 100))
-                return 0;
-
-            if (DeepDungeonPolicy.IsInForwardRoomRoute(p, srcBox.Pos, destBox.Pos, playerProgress, rectWidth))
-                return goalWeight;
-            return 0;
-        }, $"deepdungeon-route:{PlayerRoom}->{DesiredRoom.Index}:{ReasonReadable(DesiredRoom.Reason)}:via={string.Join(">", path)}:src={srcBox.Room}@({srcBox.Pos.X:F1},{srcBox.Pos.Z:F1})±({srcBox.Scale.X:F1},{srcBox.Scale.Z:F1}):next={destBox.Room}@({destBox.Pos.X:F1},{destBox.Pos.Z:F1})±({destBox.Scale.X:F1},{destBox.Scale.Z:F1}):corridor=forward[{playerProgress:F1},{srcToDestLen:F1}],halfWidth={rectWidth:F1},exclusion=player-forward10/back100/halfWidth100");
+        hints.AddGoalZone(p => DeepDungeonPolicy.ForwardRoomRoutePriority(p, srcBox.Pos, destBox.Pos, playerProgress, rectWidth, goalWeight),
+            $"deepdungeon-route:{PlayerRoom}->{DesiredRoom.Index}:{ReasonReadable(DesiredRoom.Reason)}:via={string.Join(">", path)}:src={srcBox.Room}@({srcBox.Pos.X:F1},{srcBox.Pos.Z:F1})±({srcBox.Scale.X:F1},{srcBox.Scale.Z:F1}):next={destBox.Room}@({destBox.Pos.X:F1},{destBox.Pos.Z:F1})±({destBox.Scale.X:F1},{destBox.Scale.Z:F1}):corridor=forward-progress[{playerProgress:F1},{srcToDestLen:F1}],halfWidth={rectWidth:F1}");
     }
 
     private void LogNoPathState(string? state, string message)

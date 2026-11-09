@@ -2,6 +2,7 @@
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Interface.ImGuiSeStringRenderer;
 using Dalamud.Interface.Utility;
+using FFXIVClientStructs.FFXIV.Component.GUI;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
@@ -14,6 +15,15 @@ namespace BossMod;
 
 public static partial class Utils
 {
+    public static unsafe bool IsScreenReady()
+        => !IsAddonVisible("FadeMiddle") && !IsAddonVisible("FadeBack") && !IsAddonVisible("NowLoading");
+
+    private static unsafe bool IsAddonVisible(string name)
+    {
+        var addon = (AtkUnitBase*)Service.GameGui.GetAddonByName(name).Address;
+        return addon != null && addon->IsVisible;
+    }
+
     public static string ObjectString(IGameObject obj) => $"{obj.BaseId:X} '{obj.Name}' <{obj.EntityId:X}>";
 
     public static string ObjectString(ulong id)

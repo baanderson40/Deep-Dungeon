@@ -133,6 +133,36 @@ public class DeepDungeonPolicyTests
         Assert.Contains(map.PixelPriority, priority => priority > 0);
     }
 
+    [Fact]
+    public void RoomRouteGoalRemainsStableAcrossPlayerForwardExclusionBoundary()
+    {
+        var source = new WPos(-365.8f, 299.9f);
+        var next = new WPos(-358.2f, 357.8f);
+        var routeCell = new WPos(-360.2f, 314.2f);
+        var lateralDetour = new WPos(-373.2f, 314.8f);
+        var routeLength = (next - source).Length();
+        var oldMaskExcludedRouteCell = false;
+        var oldMaskKeptRouteCell = false;
+
+        foreach (var playerZ in new[] { 303.6f, 303.8f, 304.0f, 304.2f, 304.4f })
+        {
+            var player = new WPos(-359.2f, playerZ);
+            var playerProgress = (player - source).Dot((next - source).Normalized());
+            var directPriority = DeepDungeonPolicy.ForwardRoomRoutePriority(routeCell, source, next, playerProgress, 10, 0.01f);
+            var detourPriority = DeepDungeonPolicy.ForwardRoomRoutePriority(lateralDetour, source, next, playerProgress, 10, 0.01f);
+            if (routeCell.InRect(player, new WDir(0, 1), 10, 100, 100))
+                oldMaskExcludedRouteCell = true;
+            else
+                oldMaskKeptRouteCell = true;
+
+            // This route cell crossed the old player-forward-10 exclusion as position/map raster shifted.
+            Assert.Equal(0.01f * (0.5f + 0.5f * Math.Clamp((routeCell - source).Dot((next - source).Normalized()) / routeLength, 0, 1)), directPriority, 5);
+            Assert.True(directPriority > detourPriority);
+        }
+
+        Assert.True(oldMaskExcludedRouteCell && oldMaskKeptRouteCell);
+    }
+
     [Theory]
     [InlineData(20, 0, 10, 0)]
     [InlineData(-20, 0, -10, 0)]
@@ -156,6 +186,320 @@ public class DeepDungeonPolicyTests
         Assert.True(DeepDungeonPolicy.CanAutoUsePomander(true, true, 1, true, true, false, true, false, false, out var eligibleReason));
         Assert.Equal("eligible", eligibleReason);
         Assert.True(DeepDungeonPolicy.CanAutoUsePomander(true, true, 1, true, true, false, true, true, true, out _));
+    }
+
+    [Theory]
+    [InlineData(1, 0, 3)] // POTD Strength
+    [InlineData(2, 1, 4)] // HoH Steel
+    [InlineData(1, 2, 15)] // POTD Raising
+    [InlineData(1, 3, 1)] // POTD Safety
+    [InlineData(1, 4, 11)] // POTD Serenity
+    [InlineData(1, 5, 5)] // POTD Affluence
+    [InlineData(1, 6, 6)] // POTD Flight
+    [InlineData(1, 7, 2)] // POTD Sight
+    [InlineData(1, 8, 9)] // POTD Fortune
+    [InlineData(1, 9, 14)] // POTD Intuition
+    [InlineData(2, 7, 2)] // HoH Sight
+    [InlineData(2, 8, 9)] // HoH Fortune
+    [InlineData(2, 9, 14)] // HoH Intuition
+    [InlineData(3, 0, 25)] // EO ProtoStrength
+    [InlineData(3, 1, 26)] // EO ProtoSteel
+    [InlineData(3, 2, 35)] // EO ProtoRaising
+    [InlineData(3, 3, 23)] // EO ProtoSafety
+    [InlineData(3, 4, 33)] // EO ProtoSerenity
+    [InlineData(3, 5, 27)] // EO ProtoAffluence
+    [InlineData(3, 6, 28)] // EO ProtoFlight
+    [InlineData(3, 7, 24)] // EO ProtoSight
+    [InlineData(3, 8, 31)] // EO ProtoFortune
+    [InlineData(3, 9, 34)] // EO ProtoIntuition
+    [InlineData(4, 3, 0)] // PT has no Safety
+    [InlineData(4, 7, 0)] // PT has no Sight
+    public void PomanderMaintenanceResolvesCurrentDungeonItem(int dungeon, int kind, int expected)
+        => Assert.Equal((PomanderID)expected, DeepDungeonPolicy.MaintenancePomander((DeepDungeonState.DungeonType)dungeon, (DeepDungeonPolicy.PomanderMaintenanceKind)kind));
+
+    [Theory]
+    [InlineData(false, false, 1, false, "reserve")]
+    [InlineData(false, false, 2, true, "eligible")]
+    [InlineData(true, false, 1, true, "eligible")]
+    [InlineData(false, true, 1, true, "eligible")] // Raising and Safety can use last charge on normal floors
+    public void PomanderMaintenanceAppliesPerItemChargeReserve(bool bossFloor, bool allowLastCharge, byte stock, bool expected, string expectedReason)
+    {
+        var eligible = DeepDungeonPolicy.CanMaintainPomander(true, true, true, true, true, false, true, stock, true,
+            bossFloor, allowLastCharge, false, false, false, false, false, out var reason);
+        Assert.Equal(expected, eligible);
+        Assert.Equal(expectedReason, reason);
+    }
+
+    [Fact]
+    public void SafetyPomanderIsForbiddenOnBossFloorAndAfterUseOnCurrentFloor()
+    {
+        AssertMaintenanceRejected(bossFloor: true, allowLastCharge: true, skipBossFloor: true, reason: "boss floor");
+        AssertMaintenanceRejected(allowLastCharge: true, usedThisFloor: true, reason: "already used this floor");
+        AssertMaintenanceRejected(allowLastCharge: true, bossFloor: true, skipBossFloor: true, reason: "boss floor");
+    }
+
+    [Fact]
+    public void PomanderMaintenanceRejectsUnsafeOrUncertainState()
+    {
+        AssertMaintenanceRejected(maintenance: false, reason: "maintenance disabled");
+        AssertMaintenanceRejected(autoDD: false, reason: "AutoDD disabled");
+        AssertMaintenanceRejected(floorReady: false, reason: "floor not initialized");
+        AssertMaintenanceRejected(alive: false, reason: "player dead");
+        AssertMaintenanceRejected(solo: false, reason: "not solo");
+        AssertMaintenanceRejected(itemPenalty: true, reason: "Item Penalty");
+        AssertMaintenanceRejected(validSlot: false, reason: "slot unavailable");
+        AssertMaintenanceRejected(usable: false, reason: "unusable");
+        AssertMaintenanceRejected(effectActive: true, reason: "effect active");
+        AssertMaintenanceRejected(pending: true, reason: "request pending");
+        AssertMaintenanceRejected(unknown: true, reason: "previous outcome unknown");
+    }
+
+    [Fact]
+    public void PomanderMaintenanceUsesEitherStrengthStatusAndSteelVulnerabilityStatus()
+    {
+        Assert.False(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Strength, false, false, false, false, false));
+        Assert.True(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Strength, true, false, false, false, false));
+        Assert.True(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Strength, false, true, false, false, false));
+        Assert.False(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Steel, false, false, false, false, false));
+        Assert.True(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Steel, false, false, true, false, false));
+        Assert.False(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Raising, false, false, false, false, false));
+        Assert.True(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Raising, false, false, false, true, false));
+        Assert.False(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Raising, true, true, true, false, false));
+        Assert.False(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Safety, false, false, false, false, false));
+        Assert.False(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Safety, false, false, false, false, true)); // Safety Active is not use evidence.
+        Assert.False(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Sight, false, false, false, false, true)); // Sight uses message 7256, not Active.
+        Assert.False(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Fortune, false, false, false, false, false));
+        Assert.True(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Fortune, false, false, false, false, true));
+        Assert.False(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Intuition, false, false, false, false, false));
+        Assert.True(DeepDungeonPolicy.PomanderMaintenanceEffectPresent(DeepDungeonPolicy.PomanderMaintenanceKind.Intuition, false, false, false, false, true));
+    }
+
+    [Fact]
+    public void SafetyFloorUseLatchPersistsUntilDungeonOrFloorChanges()
+    {
+        var usage = new DeepDungeonPolicy.SafetyFloorUsage(DeepDungeonState.DungeonType.POTD, 11, false);
+        usage = DeepDungeonPolicy.ObserveSafetyFloorUsage(usage, DeepDungeonState.DungeonType.POTD, 11, true);
+        Assert.True(usage.Used);
+
+        usage = DeepDungeonPolicy.ObserveSafetyFloorUsage(usage, DeepDungeonState.DungeonType.POTD, 11, false);
+        Assert.True(usage.Used);
+
+        usage = DeepDungeonPolicy.ObserveSafetyFloorUsage(usage, DeepDungeonState.DungeonType.POTD, 12, false);
+        Assert.False(usage.Used);
+        usage = DeepDungeonPolicy.ObserveSafetyFloorUsage(usage, DeepDungeonState.DungeonType.HOH, 1, false);
+        Assert.False(usage.Used);
+    }
+
+    [Fact]
+    public void SafetySystemLogConfirmsOnlyRecentMatchingSameFloorRequest()
+    {
+        var requestedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var safety = new DeepDungeonPolicy.PomanderMaintenanceRequest(
+            DeepDungeonState.DungeonType.POTD, 91, PomanderID.Safety, requestedAt, 3, false, false, true,
+            DeepDungeonPolicy.PomanderMaintenanceRequestPhase.OutcomeUnknown);
+
+        Assert.True(DeepDungeonPolicy.IsMatchingSafetyUseMessage(safety, DeepDungeonState.DungeonType.POTD, 91, requestedAt.AddSeconds(40))); // late confirmation remains valid on same floor.
+        Assert.False(DeepDungeonPolicy.IsMatchingSafetyUseMessage(safety, DeepDungeonState.DungeonType.POTD, 92, requestedAt.AddSeconds(8)));
+        Assert.False(DeepDungeonPolicy.IsMatchingSafetyUseMessage(safety, DeepDungeonState.DungeonType.HOH, 91, requestedAt.AddSeconds(8)));
+        Assert.False(DeepDungeonPolicy.IsMatchingSafetyUseMessage(safety, DeepDungeonState.DungeonType.POTD, 91, requestedAt.AddSeconds(-1)));
+
+        var nonSafety = safety with { Pomander = PomanderID.Raising };
+        Assert.False(DeepDungeonPolicy.IsMatchingSafetyUseMessage(nonSafety, DeepDungeonState.DungeonType.POTD, 91, requestedAt.AddSeconds(1)));
+    }
+
+    [Fact]
+    public void SightSystemLogMatchesSameFloorSightRequest()
+    {
+        var requestedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var sight = new DeepDungeonPolicy.PomanderMaintenanceRequest(
+            DeepDungeonState.DungeonType.EO, 41, PomanderID.ProtoSight, requestedAt, 2, false, true, false,
+            DeepDungeonPolicy.PomanderMaintenanceRequestPhase.OutcomeUnknown);
+
+        Assert.True(DeepDungeonPolicy.IsMatchingSightUseMessage(sight, DeepDungeonState.DungeonType.EO, 41, requestedAt.AddSeconds(30)));
+        Assert.False(DeepDungeonPolicy.IsMatchingSightUseMessage(sight, DeepDungeonState.DungeonType.EO, 42, requestedAt.AddSeconds(1)));
+        Assert.False(DeepDungeonPolicy.IsMatchingSightUseMessage(sight with { Pomander = PomanderID.Safety }, DeepDungeonState.DungeonType.EO, 41, requestedAt.AddSeconds(1)));
+    }
+
+    [Fact]
+    public void SafetyHasPriorityOverSightAndEitherUseOrUncertainRequestLocksPair()
+    {
+        Assert.True(DeepDungeonPolicy.ShouldSuppressSightForSafety(false, false, true, true)); // Safety eligible and enabled.
+        Assert.False(DeepDungeonPolicy.ShouldSuppressSightForSafety(false, false, true, false)); // No Safety stock/usable state: Sight fallback.
+        Assert.False(DeepDungeonPolicy.ShouldSuppressSightForSafety(false, false, false, true)); // Safety disabled: Sight fallback.
+        Assert.True(DeepDungeonPolicy.ShouldSuppressSightForSafety(true, false, false, false)); // Safety already used.
+        Assert.True(DeepDungeonPolicy.ShouldSuppressSightForSafety(false, true, false, false)); // Safety pending or unknown.
+        Assert.True(DeepDungeonPolicy.ShouldSuppressSafetyForSight(true, false));
+        Assert.True(DeepDungeonPolicy.ShouldSuppressSafetyForSight(false, true));
+        Assert.False(DeepDungeonPolicy.ShouldSuppressSafetyForSight(false, false));
+    }
+
+    [Fact]
+    public void GloomEvidenceRequiresKnownSnapshotForExactCurrentFloor()
+    {
+        var gloom = new DeepDungeonState.FloorEffects(DeepDungeonState.DungeonType.POTD, 11, true, 1, 0, 0, 3, 0, 0, 42, true, true);
+        var noGloom = gloom with { DangerID = 0, DangerUI = 0, Gloom = false };
+        var unknownMapping = gloom with { GloomKnown = false };
+
+        Assert.True(DeepDungeonPolicy.CurrentFloorGloom(gloom, DeepDungeonState.DungeonType.POTD, 11));
+        Assert.False(DeepDungeonPolicy.CurrentFloorGloom(noGloom, DeepDungeonState.DungeonType.POTD, 11));
+        Assert.Null(DeepDungeonPolicy.CurrentFloorGloom(unknownMapping, DeepDungeonState.DungeonType.POTD, 11));
+        Assert.Null(DeepDungeonPolicy.CurrentFloorGloom(gloom, DeepDungeonState.DungeonType.POTD, 12));
+        Assert.Null(DeepDungeonPolicy.CurrentFloorGloom(gloom with { Known = false }, DeepDungeonState.DungeonType.POTD, 11));
+    }
+
+    [Fact]
+    public void FloorEffectSnapshotClearsOnFloorContextChange()
+    {
+        var effects = new DeepDungeonState.FloorEffects(DeepDungeonState.DungeonType.POTD, 11, true, 1, 0, 0, 3, 0, 0, 42, true, true);
+        Assert.Equal(effects, DeepDungeonPolicy.ResetFloorEffectsForContextChange(effects, false));
+        Assert.Equal(default, DeepDungeonPolicy.ResetFloorEffectsForContextChange(effects, true));
+    }
+
+    [Fact]
+    public void SafetyAndSerenityUnknownRequestsAreScopedToTheirOriginalFloor()
+    {
+        Assert.True(DeepDungeonPolicy.IsFloorScopedMaintenanceKind(DeepDungeonPolicy.PomanderMaintenanceKind.Safety));
+        Assert.True(DeepDungeonPolicy.IsFloorScopedMaintenanceKind(DeepDungeonPolicy.PomanderMaintenanceKind.Serenity));
+        Assert.True(DeepDungeonPolicy.IsFloorScopedMaintenanceKind(DeepDungeonPolicy.PomanderMaintenanceKind.Sight));
+        Assert.True(DeepDungeonPolicy.IsFloorScopedMaintenanceKind(DeepDungeonPolicy.PomanderMaintenanceKind.Fortune));
+        Assert.False(DeepDungeonPolicy.IsFloorScopedMaintenanceKind(DeepDungeonPolicy.PomanderMaintenanceKind.Intuition));
+        Assert.False(DeepDungeonPolicy.IsFloorScopedMaintenanceKind(DeepDungeonPolicy.PomanderMaintenanceKind.Raising));
+    }
+
+    [Fact]
+    public void SerenityUsesOnlySelectedFloorEnchantmentsAndCanOverrideItemPenalty()
+    {
+        Assert.True(DeepDungeonPolicy.IsEnabledSerenityTrigger(true, false, false, false, false, false, true, true, true, true, true, true));
+        Assert.True(DeepDungeonPolicy.IsEnabledSerenityTrigger(false, true, false, false, false, false, true, true, true, true, true, true));
+        Assert.True(DeepDungeonPolicy.IsEnabledSerenityTrigger(false, false, false, true, false, false, true, true, true, true, true, true));
+        Assert.True(DeepDungeonPolicy.IsEnabledSerenityTrigger(false, false, false, false, true, false, true, true, true, true, true, true));
+        Assert.True(DeepDungeonPolicy.IsEnabledSerenityTrigger(false, false, false, false, false, true, true, true, true, true, true, true));
+        Assert.False(DeepDungeonPolicy.IsEnabledSerenityTrigger(false, false, false, false, false, false, true, true, true, true, true, true));
+        Assert.True(DeepDungeonPolicy.SerenityMayIgnoreItemPenalty(DeepDungeonPolicy.PomanderMaintenanceKind.Serenity));
+        Assert.False(DeepDungeonPolicy.SerenityMayIgnoreItemPenalty(DeepDungeonPolicy.PomanderMaintenanceKind.Flight));
+    }
+
+    [Theory]
+    [InlineData(1, 98, true)]
+    [InlineData(1, 99, false)]
+    [InlineData(1, 199, false)]
+    [InlineData(2, 89, false)]
+    [InlineData(3, 97, true)]
+    [InlineData(3, 98, false)]
+    [InlineData(4, 90, true)]
+    [InlineData(4, 99, false)]
+    public void NextFloorPomandersOnlyPrepareForEligibleNonBossFloors(int dungeon, byte floor, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.IsNextFloorEligible((DeepDungeonState.DungeonType)dungeon, floor));
+
+    [Fact]
+    public void NextFloorPomandersRequireCommittedDepartureAndNoCombat()
+    {
+        Assert.True(DeepDungeonPolicy.IsPreparingNextFloorPomander(true, true, true, true, false, true, DeepDungeonState.DungeonType.POTD, 97));
+        Assert.False(DeepDungeonPolicy.IsPreparingNextFloorPomander(true, true, false, true, false, true, DeepDungeonState.DungeonType.POTD, 97));
+        Assert.False(DeepDungeonPolicy.IsPreparingNextFloorPomander(true, true, true, true, true, true, DeepDungeonState.DungeonType.POTD, 97));
+        Assert.False(DeepDungeonPolicy.IsPreparingNextFloorPomander(true, true, true, true, false, true, DeepDungeonState.DungeonType.POTD, 99));
+    }
+
+    [Fact]
+    public void PomanderMaintenanceRequestWaitsForEffectAfterStockConsumptionAndLatchesUnknownOnTimeout()
+    {
+        var requestedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var request = new DeepDungeonPolicy.PomanderMaintenanceRequest(
+            DeepDungeonState.DungeonType.POTD, 10, PomanderID.Strength, requestedAt, 2, false, false, false,
+            DeepDungeonPolicy.PomanderMaintenanceRequestPhase.AwaitingReadback, "DamageDown");
+
+        var consumed = DeepDungeonPolicy.ObservePomanderMaintenanceRequest(request, 1, false, requestedAt.AddSeconds(1));
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.AwaitingEffect, consumed.Phase);
+        Assert.True(consumed.StockDecrementObserved);
+        Assert.Equal("DamageDown", consumed.EvidenceAtRequest); // request-time evidence is immutable through reconciliation.
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.Resolved,
+            DeepDungeonPolicy.ObservePomanderMaintenanceRequest(consumed, 1, true, requestedAt.AddSeconds(2)).Phase);
+
+        var unknown = DeepDungeonPolicy.ObservePomanderMaintenanceRequest(request, 2, false, requestedAt.AddSeconds(5));
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.OutcomeUnknown, unknown.Phase);
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.OutcomeUnknown,
+            DeepDungeonPolicy.ObservePomanderMaintenanceRequest(unknown, 1, false, requestedAt.AddSeconds(8)).Phase);
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.Resolved,
+            DeepDungeonPolicy.ObservePomanderMaintenanceRequest(unknown, 1, true, requestedAt.AddSeconds(8)).Phase);
+
+        var gloomSensitiveSerenity = request with { Pomander = PomanderID.Serenity, EffectPresentAtRequest = false };
+        var unknownGloom = DeepDungeonPolicy.ObservePomanderMaintenanceRequest(gloomSensitiveSerenity, 2, null, requestedAt.AddSeconds(5));
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.OutcomeUnknown, unknownGloom.Phase);
+        Assert.False(unknownGloom.EffectWasAbsentAfterRequest);
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.OutcomeUnknown,
+            DeepDungeonPolicy.ObservePomanderMaintenanceRequest(unknownGloom, 2, null, requestedAt.AddSeconds(8)).Phase);
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.Resolved,
+            DeepDungeonPolicy.ObservePomanderMaintenanceRequest(unknownGloom, 1, true, requestedAt.AddSeconds(9)).Phase);
+    }
+
+    [Fact]
+    public void SharedPomanderGateBlocksOtherItemUntilResolvedButReleasesOnUnknown()
+    {
+        var requestedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var steel = new DeepDungeonPolicy.PomanderMaintenanceRequest(
+            DeepDungeonState.DungeonType.POTD, 81, PomanderID.Steel, requestedAt, 3, false, false, false,
+            DeepDungeonPolicy.PomanderMaintenanceRequestPhase.AwaitingReadback);
+        var requests = new Dictionary<DeepDungeonPolicy.PomanderMaintenanceKind, DeepDungeonPolicy.PomanderMaintenanceRequest>
+        {
+            [DeepDungeonPolicy.PomanderMaintenanceKind.Steel] = steel,
+        };
+
+        Assert.True(DeepDungeonPolicy.HasBlockingPomanderMaintenanceRequest(requests, DeepDungeonPolicy.PomanderMaintenanceKind.Strength));
+        Assert.False(DeepDungeonPolicy.HasBlockingPomanderMaintenanceRequest(requests, DeepDungeonPolicy.PomanderMaintenanceKind.Steel));
+
+        requests[DeepDungeonPolicy.PomanderMaintenanceKind.Steel] = steel with { Phase = DeepDungeonPolicy.PomanderMaintenanceRequestPhase.AwaitingEffect };
+        Assert.True(DeepDungeonPolicy.HasBlockingPomanderMaintenanceRequest(requests, DeepDungeonPolicy.PomanderMaintenanceKind.Strength));
+
+        requests[DeepDungeonPolicy.PomanderMaintenanceKind.Steel] = steel with { Phase = DeepDungeonPolicy.PomanderMaintenanceRequestPhase.OutcomeUnknown };
+        Assert.False(DeepDungeonPolicy.HasBlockingPomanderMaintenanceRequest(requests, DeepDungeonPolicy.PomanderMaintenanceKind.Strength));
+        Assert.False(DeepDungeonPolicy.HasBlockingPomanderMaintenanceRequest(requests, DeepDungeonPolicy.PomanderMaintenanceKind.Steel));
+    }
+
+    [Fact]
+    public void RepeatedBuffPomanderRequestDoesNotRestartVerificationDeadline()
+    {
+        var requestedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var request = new DeepDungeonPolicy.PomanderMaintenanceRequest(
+            DeepDungeonState.DungeonType.POTD, 81, PomanderID.Steel, requestedAt, 3, false, false, false,
+            DeepDungeonPolicy.PomanderMaintenanceRequestPhase.AwaitingReadback);
+
+        var laterObservation = DeepDungeonPolicy.ObservePomanderMaintenanceRequest(request, 3, false, requestedAt.AddSeconds(4));
+        var timeout = DeepDungeonPolicy.ObservePomanderMaintenanceRequest(laterObservation, 3, false, requestedAt.AddSeconds(5));
+        Assert.Equal(requestedAt, timeout.RequestedAt);
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.OutcomeUnknown, timeout.Phase);
+    }
+
+    [Fact]
+    public void ExistingEffectAtRequestIsNotNewEvidenceUntilEffectWasObservedAbsent()
+    {
+        var requestedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var request = new DeepDungeonPolicy.PomanderMaintenanceRequest(
+            DeepDungeonState.DungeonType.POTD, 81, PomanderID.Strength, requestedAt, 2, true, false, false,
+            DeepDungeonPolicy.PomanderMaintenanceRequestPhase.AwaitingReadback);
+
+        var stillPresent = DeepDungeonPolicy.ObservePomanderMaintenanceRequest(request, 2, true, requestedAt.AddSeconds(1));
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.AwaitingReadback, stillPresent.Phase);
+        var absent = DeepDungeonPolicy.ObservePomanderMaintenanceRequest(stillPresent, 2, false, requestedAt.AddSeconds(2));
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.AwaitingReadback, absent.Phase);
+        var newlyPresent = DeepDungeonPolicy.ObservePomanderMaintenanceRequest(absent, 1, true, requestedAt.AddSeconds(3));
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.Resolved, newlyPresent.Phase);
+        Assert.True(newlyPresent.EffectWasAbsentAfterRequest);
+
+        var unavailableAtRequest = request with { EffectPresentAtRequest = null };
+        var stillUncertain = DeepDungeonPolicy.ObservePomanderMaintenanceRequest(unavailableAtRequest, 2, true, requestedAt.AddSeconds(1));
+        Assert.Equal(DeepDungeonPolicy.PomanderMaintenanceRequestPhase.AwaitingReadback, stillUncertain.Phase);
+    }
+
+    private static void AssertMaintenanceRejected(
+        bool maintenance = true, bool autoDD = true, bool floorReady = true, bool alive = true, bool solo = true,
+        bool itemPenalty = false, bool validSlot = true, byte stock = 2, bool usable = true, bool bossFloor = false,
+        bool allowLastCharge = false, bool skipBossFloor = false, bool usedThisFloor = false,
+        bool effectActive = false, bool pending = false, bool unknown = false, string reason = "")
+    {
+        Assert.False(DeepDungeonPolicy.CanMaintainPomander(maintenance, autoDD, floorReady, alive, solo, itemPenalty,
+            validSlot, stock, usable, bossFloor, allowLastCharge, skipBossFloor, usedThisFloor,
+            effectActive, pending, unknown, out var actualReason));
+        Assert.Equal(reason, actualReason);
     }
 
     [Fact]
@@ -337,6 +681,50 @@ public class DeepDungeonPolicyTests
     public void TreasureApproachWeightBreaksOutOfCombatRouteTieWithoutChangingCombatWeight(bool inCombat, float expected)
         => Assert.Equal(expected, DeepDungeonPolicy.TreasureApproachWeight(inCombat));
 
+    [Fact]
+    public void FloorStartPomandersRequireInitializedNonBossFloorAndBoundedArrivalWindow()
+    {
+        var initializedAt = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        Assert.True(DeepDungeonPolicy.IsFloorStartPomanderEligible(true, false, true, initializedAt, initializedAt.AddSeconds(45)));
+        Assert.False(DeepDungeonPolicy.IsFloorStartPomanderEligible(true, false, true, initializedAt, initializedAt.AddSeconds(45).AddTicks(1)));
+        Assert.False(DeepDungeonPolicy.IsFloorStartPomanderEligible(true, true, true, initializedAt, initializedAt));
+        Assert.False(DeepDungeonPolicy.IsFloorStartPomanderEligible(true, false, false, initializedAt, initializedAt));
+        Assert.False(DeepDungeonPolicy.IsFloorStartPomanderEligible(true, false, true, initializedAt, initializedAt.AddTicks(-1)));
+        Assert.False(DeepDungeonPolicy.IsFloorStartPomanderEligible(false, false, true, initializedAt, initializedAt));
+    }
+
+    [Fact]
+    public void TreasureProgressGoalRewardsCloserPositionsAndNotDistantInteractionAttraction()
+    {
+        var player = new WPos(0, 0);
+        var chest = new WPos(20, 0);
+        var goal = DeepDungeonPolicy.TreasureProgressGoal(chest, player, 100, 1, 0.02f);
+        Assert.Equal(0, goal(player));
+        Assert.Equal(0.02f, goal(new WPos(10, 0)));
+        Assert.Equal(0, goal(new WPos(-10, 0)));
+        Assert.Equal(0, goal(new WPos(120, 0)));
+    }
+
+    [Fact]
+    public void TreasureRecoveryRequiresRepeatedOscillationAndRespectsOwnershipAndInteraction()
+    {
+        Assert.True(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(30), true, false, false, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(false, TimeSpan.FromSeconds(60), true, false, false, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(29.9), true, false, false, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(60), false, false, false, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(60), true, true, false, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(60), true, false, true, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(60), true, false, false, true, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(60), true, false, false, false, true));
+
+        var now = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        Assert.False(DeepDungeonPolicy.IsTreasureRecoveryReady(now, now.AddSeconds(9.99)));
+        Assert.True(DeepDungeonPolicy.IsTreasureRecoveryReady(now, now.AddSeconds(10)));
+        Assert.False(DeepDungeonPolicy.IsTreasureRecoveryReady(now, now.AddSeconds(30).AddTicks(1)));
+        Assert.True(DeepDungeonPolicy.IsTreasureDeferred(now, now.AddSeconds(59.99)));
+        Assert.False(DeepDungeonPolicy.IsTreasureDeferred(now, now.AddSeconds(60)));
+    }
+
     [Theory]
     [InlineData(false, false, false, true)]  // no room objective: actor goal can guide to active passage
     [InlineData(true, true, false, true)]    // room objective is passage itself: goals are compatible
@@ -412,6 +800,25 @@ public class DeepDungeonPolicyTests
     [InlineData(false, true, true, true, (int)DeepDungeonPolicy.PomanderDispatchStatus.Issued)]
     public void PomanderDispatchResultReflectsNativeRequestPrerequisites(bool locked, bool validAction, bool director, bool slot, int expected)
         => Assert.Equal((DeepDungeonPolicy.PomanderDispatchStatus)expected, DeepDungeonPolicy.GetPomanderDispatchStatus(locked, validAction, director, slot));
+
+    [Theory]
+    [InlineData(false, true, false, false, true, "local player unavailable")]
+    [InlineData(true, false, false, false, true, "player state not loaded")]
+    [InlineData(true, true, true, false, true, "area transition active")]
+    [InlineData(true, true, false, true, true, "area transition active")]
+    [InlineData(true, true, false, false, false, "loading screen visible")]
+    [InlineData(true, true, false, false, true, null)]
+    public void PomanderDispatchReadinessBlocksUnavailablePlayerAndAreaTransitions(bool playerAvailable, bool playerStateLoaded, bool betweenAreas, bool betweenAreas51, bool screenReady, string? expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.PomanderReadinessBlocker(playerAvailable, playerStateLoaded, betweenAreas, betweenAreas51, screenReady));
+
+    [Theory]
+    [InlineData(false, false, false, true, "local player unavailable")]
+    [InlineData(true, true, false, true, "area transition active")]
+    [InlineData(true, false, true, true, "area transition active")]
+    [InlineData(true, false, false, false, "loading screen visible")]
+    [InlineData(true, false, false, true, null)]
+    public void PomanderSchedulingReadinessDoesNotQueueDuringTransfer(bool playerAvailable, bool betweenAreas, bool betweenAreas51, bool screenReady, string? expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.PomanderSchedulingReadinessBlocker(playerAvailable, betweenAreas, betweenAreas51, screenReady));
 
     [Fact]
     public void ReadbackCorrelationIsBoundedAndRejectsFutureRequestTimestamp()
@@ -497,6 +904,19 @@ public class DeepDungeonPolicyTests
     [InlineData(true, true, "previous-candidate-still-eligible")]
     public void ActorSelectionDiagnosticsDescribePreviousCandidateState(bool inCandidates, bool eligible, string expected)
         => Assert.Equal(expected, DeepDungeonPolicy.ActorSelectionTransitionReason(inCandidates, eligible));
+
+    [Fact]
+    public void DistantHoardProgressGoalCoversLocalCellsAndRequiresCloserPosition()
+    {
+        var player = new WPos(0, 0);
+        var hoard = new WPos(44.6f, 0);
+        var goal = DeepDungeonPolicy.HoardProgressGoal(hoard, player, 100, 1, 10);
+
+        Assert.Equal(0, goal(player));
+        Assert.Equal(10, goal(new WPos(2, 0)));
+        Assert.Equal(0, goal(new WPos(-2, 0)));
+        Assert.Equal(0, goal(new WPos(-60, 0)));
+    }
 
     [Fact]
     public void BossFloorTilesetIsNotReportedAsOrdinaryGeometryInput()

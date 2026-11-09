@@ -644,6 +644,20 @@ public sealed unsafe class ActionManagerEx(
 
     private bool UsePomanderNative(ActionID action)
     {
+        var ui = UIState.Instance();
+        var playerObject = (Character*)GameObjectManager.Instance()->Objects.IndexSorted[0].Value;
+        var readinessBlocker = DeepDungeonPolicy.PomanderReadinessBlocker(
+            playerObject != null && playerObject->IsCharacter(),
+            ui != null && ui->PlayerState.IsLoaded,
+            condition[ConditionFlag.BetweenAreas],
+            condition[ConditionFlag.BetweenAreas51],
+            Utils.IsScreenReady());
+        if (readinessBlocker != null)
+        {
+            LogPomanderDispatch(action, $"not issued: {readinessBlocker}");
+            return false;
+        }
+
         var validDungeonAndAction = ws.DeepDungeon.DungeonId != DeepDungeonState.DungeonType.None && action.ID is > 0 and < (uint)PomanderID.Count;
         var animationLocked = _inst->AnimationLock > 0;
         InstanceContentDeepDungeon* dd = null;

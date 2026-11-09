@@ -311,6 +311,12 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
         var diagnosticKind = DeepDungeonPolicy.ClassifyMovementDiagnostic(
             HasRepeatedRouteReversals(), World.DeepDungeon.IsBossFloor, interactionSuppressed, castingSuppressed,
             Player.InCombat, decision.Destination != null, movementIssued, goalHere, goalDestination);
+        if (diagnosticKind == DeepDungeonPolicy.MovementDiagnosticKind.NavigationOscillation && Hints.DeepDungeonTreasureGoalID != 0)
+        {
+            Hints.DeepDungeonOscillatingTreasureID = Hints.DeepDungeonTreasureGoalID;
+            Hints.DeepDungeonOscillationFloor = World.DeepDungeon.Floor;
+            Hints.DeepDungeonOscillationAt = now;
+        }
         var decisionAge = _lastDecisionUpdatedAt == default ? "unknown" : $"{(now - _lastDecisionUpdatedAt).TotalSeconds:F1}s";
         var requestAge = decision.RequestedAt == default ? "unknown" : $"{(now - decision.RequestedAt).TotalSeconds:F2}s";
         static string FormatPosition(WPos? position) => position is { } p ? $"(x:{p.X:F1},z:{p.Z:F1})" : "none";

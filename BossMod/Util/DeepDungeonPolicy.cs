@@ -48,6 +48,199 @@ internal static class DeepDungeonPolicy
         MissingDirectorOrSlot,
     }
 
+    internal enum PomanderMaintenanceKind
+    {
+        Strength,
+        Steel,
+        Raising,
+        Safety,
+        Serenity,
+        Affluence,
+        Flight,
+        Sight,
+        Fortune,
+        Intuition,
+    }
+
+    internal enum PomanderMaintenanceRequestPhase
+    {
+        AwaitingReadback,
+        AwaitingEffect,
+        OutcomeUnknown,
+        Resolved,
+    }
+
+    internal static readonly TimeSpan PomanderMaintenanceReadbackWindow = TimeSpan.FromSeconds(5);
+    internal readonly record struct PomanderMaintenanceRequest(
+        DeepDungeonState.DungeonType Dungeon, byte Floor, PomanderID Pomander, DateTime RequestedAt, byte StockAtRequest,
+        bool? EffectPresentAtRequest, bool EffectWasAbsentAfterRequest, bool StockDecrementObserved, PomanderMaintenanceRequestPhase Phase,
+        string? EvidenceAtRequest = null);
+
+    internal static string? PomanderReadinessBlocker(bool localPlayerAvailable, bool playerStateLoaded, bool betweenAreas, bool betweenAreas51, bool screenReady)
+        => !localPlayerAvailable ? "local player unavailable"
+        : !playerStateLoaded ? "player state not loaded"
+        : betweenAreas || betweenAreas51 ? "area transition active"
+        : !screenReady ? "loading screen visible"
+        : null;
+
+    internal static string? PomanderSchedulingReadinessBlocker(bool localPlayerAvailable, bool betweenAreas, bool betweenAreas51, bool screenReady)
+        => !localPlayerAvailable ? "local player unavailable"
+        : betweenAreas || betweenAreas51 ? "area transition active"
+        : !screenReady ? "loading screen visible"
+        : null;
+
+    internal readonly record struct SafetyFloorUsage(DeepDungeonState.DungeonType Dungeon, byte Floor, bool Used);
+
+    internal static SafetyFloorUsage ObserveSafetyFloorUsage(SafetyFloorUsage usage, DeepDungeonState.DungeonType dungeon, byte floor, bool effectActive)
+    {
+        if (usage.Dungeon != dungeon || usage.Floor != floor)
+            usage = new(dungeon, floor, false);
+        return usage with { Used = usage.Used || effectActive };
+    }
+
+    internal static bool IsMatchingSafetyUseMessage(
+        PomanderMaintenanceRequest request, DeepDungeonState.DungeonType dungeon, byte floor, DateTime now)
+        => request.Pomander is PomanderID.Safety or PomanderID.ProtoSafety
+            && request.Dungeon == dungeon && request.Floor == floor
+            && request.Phase != PomanderMaintenanceRequestPhase.Resolved
+            && now >= request.RequestedAt;
+
+    internal static bool IsMatchingSightUseMessage(
+        PomanderMaintenanceRequest request, DeepDungeonState.DungeonType dungeon, byte floor, DateTime now)
+        => request.Pomander is PomanderID.Sight or PomanderID.ProtoSight
+            && request.Dungeon == dungeon && request.Floor == floor
+            && request.Phase != PomanderMaintenanceRequestPhase.Resolved
+            && now >= request.RequestedAt;
+
+    internal static bool ShouldSuppressSightForSafety(bool safetyUsedThisFloor, bool safetyRequestUnresolved, bool safetyEnabled, bool safetyAvailable)
+        => safetyUsedThisFloor || safetyRequestUnresolved || safetyEnabled && safetyAvailable;
+
+    internal static bool ShouldSuppressSafetyForSight(bool sightUsedThisFloor, bool sightRequestUnresolved)
+        => sightUsedThisFloor || sightRequestUnresolved;
+
+    internal static bool? CurrentFloorGloom(DeepDungeonState.FloorEffects effects, DeepDungeonState.DungeonType dungeon, byte floor)
+        => effects.Known && effects.GloomKnown && effects.Dungeon == dungeon && effects.Floor == floor ? effects.Gloom : null;
+
+    internal static DeepDungeonState.FloorEffects ResetFloorEffectsForContextChange(DeepDungeonState.FloorEffects effects, bool contextChanged)
+        => contextChanged ? default : effects;
+
+    internal static bool IsBlockingPomanderMaintenanceRequest(PomanderMaintenanceRequestPhase phase)
+        => phase is PomanderMaintenanceRequestPhase.AwaitingReadback or PomanderMaintenanceRequestPhase.AwaitingEffect;
+
+    internal static bool IsFloorScopedMaintenanceKind(PomanderMaintenanceKind kind)
+        => kind is PomanderMaintenanceKind.Safety or PomanderMaintenanceKind.Sight or PomanderMaintenanceKind.Serenity or PomanderMaintenanceKind.Fortune;
+
+    internal static bool HasBlockingPomanderMaintenanceRequest(
+        IEnumerable<KeyValuePair<PomanderMaintenanceKind, PomanderMaintenanceRequest>> requests,
+        PomanderMaintenanceKind exceptKind)
+        => requests.Any(entry => entry.Key != exceptKind && IsBlockingPomanderMaintenanceRequest(entry.Value.Phase));
+
+    internal static PomanderID MaintenancePomander(DeepDungeonState.DungeonType dungeon, PomanderMaintenanceKind kind)
+        => (dungeon, kind) switch
+        {
+            (DeepDungeonState.DungeonType.POTD or DeepDungeonState.DungeonType.HOH, PomanderMaintenanceKind.Strength) => PomanderID.Strength,
+            (DeepDungeonState.DungeonType.POTD or DeepDungeonState.DungeonType.HOH, PomanderMaintenanceKind.Steel) => PomanderID.Steel,
+            (DeepDungeonState.DungeonType.POTD or DeepDungeonState.DungeonType.HOH, PomanderMaintenanceKind.Raising) => PomanderID.Raising,
+            (DeepDungeonState.DungeonType.POTD or DeepDungeonState.DungeonType.HOH, PomanderMaintenanceKind.Safety) => PomanderID.Safety,
+            (DeepDungeonState.DungeonType.POTD or DeepDungeonState.DungeonType.HOH, PomanderMaintenanceKind.Sight) => PomanderID.Sight,
+            (DeepDungeonState.DungeonType.POTD or DeepDungeonState.DungeonType.HOH, PomanderMaintenanceKind.Serenity) => PomanderID.Serenity,
+            (DeepDungeonState.DungeonType.POTD or DeepDungeonState.DungeonType.HOH, PomanderMaintenanceKind.Fortune) => PomanderID.Fortune,
+            (DeepDungeonState.DungeonType.POTD or DeepDungeonState.DungeonType.HOH, PomanderMaintenanceKind.Intuition) => PomanderID.Intuition,
+            (DeepDungeonState.DungeonType.POTD or DeepDungeonState.DungeonType.HOH, PomanderMaintenanceKind.Affluence) => PomanderID.Affluence,
+            (DeepDungeonState.DungeonType.POTD or DeepDungeonState.DungeonType.HOH, PomanderMaintenanceKind.Flight) => PomanderID.Flight,
+            (DeepDungeonState.DungeonType.EO, PomanderMaintenanceKind.Strength) => PomanderID.ProtoStrength,
+            (DeepDungeonState.DungeonType.EO, PomanderMaintenanceKind.Steel) => PomanderID.ProtoSteel,
+            (DeepDungeonState.DungeonType.EO, PomanderMaintenanceKind.Raising) => PomanderID.ProtoRaising,
+            (DeepDungeonState.DungeonType.EO, PomanderMaintenanceKind.Safety) => PomanderID.ProtoSafety,
+            (DeepDungeonState.DungeonType.EO, PomanderMaintenanceKind.Sight) => PomanderID.ProtoSight,
+            (DeepDungeonState.DungeonType.EO, PomanderMaintenanceKind.Serenity) => PomanderID.ProtoSerenity,
+            (DeepDungeonState.DungeonType.EO, PomanderMaintenanceKind.Fortune) => PomanderID.ProtoFortune,
+            (DeepDungeonState.DungeonType.EO, PomanderMaintenanceKind.Intuition) => PomanderID.ProtoIntuition,
+            (DeepDungeonState.DungeonType.EO, PomanderMaintenanceKind.Affluence) => PomanderID.ProtoAffluence,
+            (DeepDungeonState.DungeonType.EO, PomanderMaintenanceKind.Flight) => PomanderID.ProtoFlight,
+            _ => PomanderID.None,
+        };
+
+    internal static bool PomanderMaintenanceEffectPresent(PomanderMaintenanceKind kind, bool strengthDamageUp, bool strengthHealingPotencyUp, bool steelVulnerabilityDown, bool raisingItemActive, bool pomanderItemActive)
+        => kind switch
+        {
+            PomanderMaintenanceKind.Strength => strengthDamageUp || strengthHealingPotencyUp,
+            PomanderMaintenanceKind.Steel => steelVulnerabilityDown,
+            PomanderMaintenanceKind.Raising => raisingItemActive,
+            // Safety's use is a one-shot floor event, not a persistent item Active effect.
+            PomanderMaintenanceKind.Safety => false,
+            // Sight is confirmed by system log 7256, not the item Active bit.
+            PomanderMaintenanceKind.Sight => false,
+            PomanderMaintenanceKind.Fortune or PomanderMaintenanceKind.Intuition or PomanderMaintenanceKind.Affluence or PomanderMaintenanceKind.Flight => pomanderItemActive,
+            _ => false,
+        };
+
+    internal static bool CanMaintainPomander(
+        bool maintenanceEnabled, bool autoDDEnabled, bool floorReady, bool alive, bool solo, bool itemPenalty,
+        bool validSlot, byte stock, bool usable, bool bossFloor, bool allowLastCharge, bool skipBossFloor, bool alreadyUsedThisFloor,
+        bool effectActive, bool requestPending, bool outcomeUnknown,
+        out string reason)
+    {
+        reason = !maintenanceEnabled ? "maintenance disabled"
+            : !autoDDEnabled ? "AutoDD disabled"
+            : !floorReady ? "floor not initialized"
+            : !alive ? "player dead"
+            : !solo ? "not solo"
+            : itemPenalty ? "Item Penalty"
+            : !validSlot ? "slot unavailable"
+            : skipBossFloor && bossFloor ? "boss floor"
+            : outcomeUnknown ? "previous outcome unknown"
+            : requestPending ? "request pending"
+            : effectActive ? "effect active"
+            : alreadyUsedThisFloor ? "already used this floor"
+            : !usable ? "unusable"
+            : stock < (bossFloor || allowLastCharge ? 1 : 2) ? "reserve"
+            : "eligible";
+        return reason == "eligible";
+    }
+
+    internal static bool IsEnabledSerenityTrigger(bool itemPenalty, bool amnesia, bool gloom, bool damageDown, bool hpPenalty, bool autoHealPenalty,
+        bool useItemPenalty, bool useAmnesia, bool useGloom, bool useDamageDown, bool useHPPenalty, bool useAutoHealPenalty)
+        => itemPenalty && useItemPenalty || amnesia && useAmnesia || gloom && useGloom || damageDown && useDamageDown || hpPenalty && useHPPenalty || autoHealPenalty && useAutoHealPenalty;
+
+    internal static bool SerenityMayIgnoreItemPenalty(PomanderMaintenanceKind kind) => kind == PomanderMaintenanceKind.Serenity;
+
+    internal static bool IsNextFloorEligible(DeepDungeonState.DungeonType dungeon, byte floor)
+    {
+        var maxFloor = dungeon switch
+        {
+            DeepDungeonState.DungeonType.POTD => 200,
+            DeepDungeonState.DungeonType.HOH or DeepDungeonState.DungeonType.EO or DeepDungeonState.DungeonType.PT => 100,
+            _ => 0,
+        };
+        var nextFloor = floor + 1;
+        return floor > 0 && floor < maxFloor && nextFloor % 10 != 0 && !(dungeon is DeepDungeonState.DungeonType.EO or DeepDungeonState.DungeonType.PT && nextFloor == 99);
+    }
+
+    internal static bool IsPreparingNextFloorPomander(bool enabled, bool passageActive, bool departureIntent, bool alive, bool inCombat,
+        bool floorReady, DeepDungeonState.DungeonType dungeon, byte floor)
+        => enabled && passageActive && departureIntent && alive && !inCombat && floorReady && IsNextFloorEligible(dungeon, floor);
+
+    internal static PomanderMaintenanceRequest ObservePomanderMaintenanceRequest(
+        PomanderMaintenanceRequest request, byte currentStock, bool? effectPresent, DateTime now)
+    {
+        var effectWasAbsentAfterRequest = request.EffectWasAbsentAfterRequest || effectPresent == false;
+        if (effectPresent == true && (request.EffectPresentAtRequest == false || request.EffectWasAbsentAfterRequest))
+            return request with { EffectWasAbsentAfterRequest = effectWasAbsentAfterRequest, Phase = PomanderMaintenanceRequestPhase.Resolved };
+
+        var stockDecrementObserved = request.StockDecrementObserved || currentStock < request.StockAtRequest;
+        if (request.Phase == PomanderMaintenanceRequestPhase.OutcomeUnknown)
+            return request with { EffectWasAbsentAfterRequest = effectWasAbsentAfterRequest, StockDecrementObserved = stockDecrementObserved };
+        if (now - request.RequestedAt >= PomanderMaintenanceReadbackWindow)
+            return request with { EffectWasAbsentAfterRequest = effectWasAbsentAfterRequest, StockDecrementObserved = stockDecrementObserved, Phase = PomanderMaintenanceRequestPhase.OutcomeUnknown };
+        return request with
+        {
+            EffectWasAbsentAfterRequest = effectWasAbsentAfterRequest,
+            StockDecrementObserved = stockDecrementObserved,
+            Phase = stockDecrementObserved ? PomanderMaintenanceRequestPhase.AwaitingEffect : PomanderMaintenanceRequestPhase.AwaitingReadback,
+        };
+    }
+
     internal enum OvercapAttributionStatus
     {
         Matched,
@@ -123,6 +316,16 @@ internal static class DeepDungeonPolicy
         return progress >= startProgress && progress <= length && MathF.Abs(offset.Cross(direction)) <= halfWidth;
     }
 
+    internal static float ForwardRoomRoutePriority(WPos point, WPos source, WPos nextRoom, float startProgress, float halfWidth, float maxPriority)
+    {
+        if (maxPriority <= 0 || !IsInForwardRoomRoute(point, source, nextRoom, startProgress, halfWidth))
+            return 0;
+
+        var routeLength = (nextRoom - source).Length();
+        var progress = (point - source).Dot((nextRoom - source) / routeLength);
+        return maxPriority * (0.5f + 0.5f * Math.Clamp(progress / routeLength, 0, 1));
+    }
+
     internal static bool ShouldKeepFullClearDestination(bool fullClearEnabled, bool roomActive, bool roomRevealed)
         => fullClearEnabled && roomActive && !roomRevealed;
 
@@ -131,6 +334,39 @@ internal static class DeepDungeonPolicy
 
     internal static float TreasureApproachWeight(bool inCombat)
         => inCombat ? 1 : 0.02f;
+
+    internal static readonly TimeSpan FloorStartPomanderWindow = TimeSpan.FromSeconds(45);
+    internal static readonly TimeSpan TreasureRecoveryCooldown = TimeSpan.FromSeconds(60);
+    internal static readonly TimeSpan TreasureRecoveryRepeatWindow = TimeSpan.FromSeconds(10);
+    internal static readonly TimeSpan TreasureRecoveryRefreshWindow = TimeSpan.FromSeconds(2);
+
+    internal static bool IsFloorStartPomanderEligible(bool configured, bool bossFloor, bool initialized, DateTime initializedAt, DateTime now)
+        => configured && !bossFloor && initialized && initializedAt != default && now >= initializedAt && now - initializedAt <= FloorStartPomanderWindow;
+
+    internal static bool ShouldDeferTreasureForOscillation(bool oscillating, TimeSpan noProgressFor, bool roomObjective, bool manualNavigation,
+        bool inCombat, bool casting, bool interactionInRange)
+        => oscillating && noProgressFor >= TimeSpan.FromSeconds(30) && roomObjective && !manualNavigation && !inCombat && !casting && !interactionInRange;
+
+    internal static bool IsTreasureRecoveryReady(DateTime firstRecoveryAt, DateTime now)
+        => firstRecoveryAt != default && now >= firstRecoveryAt
+            && now - firstRecoveryAt >= TreasureRecoveryRepeatWindow
+            && now - firstRecoveryAt <= TimeSpan.FromSeconds(30);
+
+    internal static bool IsTreasureRefreshSuppressed(DateTime refreshAt, DateTime now)
+        => refreshAt != default && now >= refreshAt && now - refreshAt < TreasureRecoveryRefreshWindow;
+
+    internal static bool IsTreasureDeferred(DateTime deferredAt, DateTime now)
+        => deferredAt != default && now >= deferredAt && now - deferredAt < TreasureRecoveryCooldown;
+
+    internal static Func<WPos, float> TreasureProgressGoal(WPos target, WPos player, float maxRange, float minProgress, float weight)
+    {
+        var playerDistance = (target - player).Length();
+        return p =>
+        {
+            var distance = (target - p).Length();
+            return playerDistance > 2 && distance <= maxRange && distance + minProgress < playerDistance ? weight : 0;
+        };
+    }
 
     internal static bool ShouldAddPassageActorGoal(bool hasRoomDestination, bool headingToPassage, bool hasManualDestination)
         => !hasManualDestination && (!hasRoomDestination || headingToPassage);
@@ -142,6 +378,16 @@ internal static class DeepDungeonPolicy
         {
             var distance = (target - p).Length();
             return playerDistance > preferredRange && distance <= maxRange && distance + minProgress < playerDistance ? weight : 0;
+        };
+    }
+
+    internal static Func<WPos, float> HoardProgressGoal(WPos target, WPos player, float maxRange, float minProgress, float weight)
+    {
+        var playerDistance = (target - player).Length();
+        return p =>
+        {
+            var distance = (target - p).Length();
+            return playerDistance > 2 && distance <= maxRange && distance + minProgress < playerDistance ? weight : 0;
         };
     }
 

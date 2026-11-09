@@ -144,6 +144,11 @@ public sealed class AIHints
 
     // Diagnostic-only request for a pathfinding snapshot; does not affect movement or goal scoring.
     public string? DeepDungeonDiagnosticRequest;
+    // Latched diagnostic signal consumed by Deep Dungeon recovery on the next hint update.
+    public ulong DeepDungeonOscillatingTreasureID;
+    public byte DeepDungeonOscillationFloor;
+    public DateTime DeepDungeonOscillationAt;
+    public ulong DeepDungeonTreasureGoalID;
 
     public void AddGoalZone(Func<WPos, float> goal, string? diagnosticOwner = null)
     {
@@ -229,6 +234,7 @@ public sealed class AIHints
         GoalZones.Clear();
         GoalZoneOwners.Clear();
         DeepDungeonDiagnosticRequest = null;
+        DeepDungeonTreasureGoalID = 0;
         Voidzones.Clear();
         TemporaryObstacles.Clear();
         Portals.Clear();

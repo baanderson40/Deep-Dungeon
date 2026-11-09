@@ -19,6 +19,7 @@ using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Common.Component.BGCollision;
 using FFXIVClientStructs.Interop;
 using Microsoft.Extensions.Hosting;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -48,15 +49,19 @@ sealed unsafe class WorldStateGameSync(
     private readonly List<ulong> _playerEnmity = [];
 
     private readonly List<WorldState.Operation> _globalOps = [];
+    private readonly ConcurrentQueue<PendingDeepDungeonMapEffects> _pendingDeepDungeonMapEffects = new();
     private readonly Dictionary<ulong, List<WorldState.Operation>> _actorOps = [];
     private readonly Dictionary<ulong, Vector3> _lastCastPositions = []; // unfortunately, game only saves cast location for area-targeted spells
     private readonly Actor?[] _actorsByIndex = new Actor?[ObjectTableSize];
 
     private bool _needInventoryUpdate = true;
 
+    private readonly record struct PendingDeepDungeonMapEffects(byte Layout, byte StatusID, byte BanID, byte DangerID, DateTime ReceivedAt);
+
     private readonly Network.OpcodeMap _opcodeMap = new();
     private readonly Network.PacketInterceptor _interceptor = new();
     private readonly Network.PacketDecoderGame _decoder = new();
+    private bool _configuredRecvEnabled;
 
     private readonly AIHintsConfig _solverConfig = configRoot.Get<AIHintsConfig>();
     private readonly EventSubscriptions _subscriptions = new();
@@ -117,7 +122,8 @@ sealed unsafe class WorldStateGameSync(
 
         _netConfig = configRoot.GetAndSubscribe<ReplayManagementConfig>(config =>
         {
-            _interceptor.ActiveRecv = config.RecordServerPackets || config.DumpServerPackets;
+            _configuredRecvEnabled = config.RecordServerPackets || config.DumpServerPackets;
+            _interceptor.ActiveRecv = _configuredRecvEnabled || ws.DeepDungeon.DungeonId != DeepDungeonState.DungeonType.None;
             _interceptor.ActiveSend = config.DumpClientPackets;
         });
         _subscriptions.Add(
@@ -998,6 +1004,58 @@ sealed unsafe class WorldStateGameSync(
             ws.Execute(new DeepDungeonState.OpProgressChange(DeepDungeonState.DungeonType.None, default));
         }
         // else: we were and still are outside deep dungeon, nothing to do
+
+        ApplyPendingDeepDungeonMapEffects();
+        var captureServerPackets = _configuredRecvEnabled || ws.DeepDungeon.DungeonId != DeepDungeonState.DungeonType.None;
+        if (_interceptor.ActiveRecv != captureServerPackets)
+            _interceptor.ActiveRecv = captureServerPackets;
+    }
+
+    private void ApplyPendingDeepDungeonMapEffects()
+    {
+        while (_pendingDeepDungeonMapEffects.TryDequeue(out var packet))
+        {
+            var dungeon = ws.DeepDungeon.DungeonId;
+            var floor = ws.DeepDungeon.Floor;
+            if (dungeon == DeepDungeonState.DungeonType.None || floor == 0)
+                continue;
+
+            var expectedLayout = ws.DeepDungeon.IsBossFloor ? (byte)Network.ServerIPC.DeepDungeonLayout.Boss : ws.DeepDungeon.Progress.Tileset switch
+            {
+                0 => (byte)Network.ServerIPC.DeepDungeonLayout.A,
+                1 => (byte)Network.ServerIPC.DeepDungeonLayout.B,
+                2 => (byte)Network.ServerIPC.DeepDungeonLayout.C,
+                _ => (byte)Network.ServerIPC.DeepDungeonLayout.None,
+            };
+            if (packet.Layout != expectedLayout)
+            {
+                logger.Debug($"[WSGS] ignored DeepDungeonMap floor-effect snapshot: layout={packet.Layout}, expected={expectedLayout}, dungeon={dungeon}, floor={floor}; effect state remains unknown.");
+                continue;
+            }
+
+            var statusUI = ResolveFloorEffect(Service.LuminaRow<Lumina.Excel.Sheets.DeepDungeonStatus>(packet.StatusID)?.FloorEffectUI.ValueNullable);
+            var banUI = ResolveFloorEffect(Service.LuminaRow<Lumina.Excel.Sheets.DeepDungeonBan>(packet.BanID)?.FloorEffectUI.ValueNullable);
+            var dangerUI = ResolveFloorEffect(Service.LuminaRow<Lumina.Excel.Sheets.DeepDungeonDanger>(packet.DangerID)?.FloorEffectUI.ValueNullable);
+            var gloomKnown = (packet.StatusID == 0 || statusUI.RowID != 0)
+                && (packet.BanID == 0 || banUI.RowID != 0)
+                && (packet.DangerID == 0 || dangerUI.RowID != 0);
+            var gloom = statusUI.IsGloom || banUI.IsGloom || dangerUI.IsGloom;
+            var effects = new DeepDungeonState.FloorEffects(dungeon, floor, true, packet.Layout, packet.StatusID, packet.BanID, packet.DangerID,
+                statusUI.RowID, banUI.RowID, dangerUI.RowID, gloomKnown, gloom);
+            if (ws.DeepDungeon.FloorEffectsSnapshot != effects)
+            {
+                ws.Execute(new DeepDungeonState.OpFloorEffectsChange(effects));
+                logger.Debug($"[WSGS] DeepDungeonMap floor effects: dungeon={dungeon}, floor={floor}, layout={packet.Layout}, status={packet.StatusID}->{statusUI.RowID}/{statusUI.Name}, ban={packet.BanID}->{banUI.RowID}/{banUI.Name}, danger={packet.DangerID}->{dangerUI.RowID}/{dangerUI.Name}, gloomKnown={gloomKnown}, gloom={gloom}; received={packet.ReceivedAt:O}.");
+            }
+        }
+    }
+
+    private static (uint RowID, bool IsGloom, string Name) ResolveFloorEffect(Lumina.Excel.Sheets.DeepDungeonFloorEffectUI? row)
+    {
+        if (row is not { } value)
+            return default;
+        var name = value.Name.ToString();
+        return (value.RowId, name.Equals("Gloom", StringComparison.OrdinalIgnoreCase), name);
     }
 
     private byte SanitizeDeepDungeonRoom(sbyte room) => room < 0 ? (byte)0 : (byte)room;
@@ -1041,7 +1099,15 @@ sealed unsafe class WorldStateGameSync(
     private void ServerIPCReceived(DateTime sendTimestamp, uint sourceServerActor, uint targetServerActor, ushort opcode, uint epoch, Span<byte> payload)
     {
         var id = _opcodeMap.ID(opcode);
-        // targetServerActor is always a player?..
+        if (id == Network.ServerIPC.PacketID.DeepDungeonMap && payload.Length >= sizeof(Network.ServerIPC.DeepDungeonMap))
+        {
+            fixed (byte* data = payload)
+            {
+                var map = (Network.ServerIPC.DeepDungeonMap*)data;
+                _pendingDeepDungeonMapEffects.Enqueue(new((byte)map->LayoutInitType, map->StatusId, map->BanId, map->DangerId, sendTimestamp));
+            }
+        }
+        // targetServerActor is always a player?
         var ipc = new NetworkState.ServerIPC(id, opcode, epoch, sourceServerActor, sendTimestamp, [.. payload]);
         if (_netConfig.Data.RecordServerPackets)
             _globalOps.Add(new NetworkState.OpServerIPC(ipc));

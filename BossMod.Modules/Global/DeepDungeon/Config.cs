@@ -54,6 +54,39 @@ public class AutoDDConfig : ConfigNode
     public BitMask AutoPoms;
     public BitMask AutoMagicite;
     public BitMask AutoDemiclone;
+    [SectionStart("Active buff maintenance")]
+    [PropertyDisplay("Maintain Strength", tooltip: "Maintain Strength in and out of combat. Preserve one pomander on normal floors; allow the reserved last charge on boss-floor arrival. Never refresh while its effect is active.")]
+    public bool MaintainStrength;
+    [PropertyDisplay("Maintain Steel", tooltip: "Maintain Steel in and out of combat. Preserve one pomander on normal floors; allow the reserved last charge on boss-floor arrival. Never refresh while its effect is active.")]
+    public bool MaintainSteel;
+    [PropertyDisplay("Maintain Raising", tooltip: "Maintain Raising protection in and out of combat. May spend the last charge on any floor. Uses the pomander's active item-effect flag as protection evidence.")]
+    public bool MaintainRaising;
+    [PropertyDisplay("Use Safety at floor start", tooltip: "Use Safety once during the first 45 seconds of an initialized non-boss floor, even if it is the last charge. Mid-floor pickups wait until a later floor. Never use on boss floors. System log 7255 confirms use.")]
+    public bool AutoSafety;
+    [PropertyDisplay("Use Sight at floor start", tooltip: "Use Sight during the first 45 seconds of an initialized non-boss floor as fallback when Safety is unavailable. Safety takes priority; never automatically use both on one floor. System log 7256 confirms use.")]
+    public bool AutoSight;
+    [PropertyDisplay("Use Serenity for selected floor effects", tooltip: "Opt-in; detects selected player statuses and Gloom when current-floor floor-effect data is known. Serenity removes every floor enchantment, including beneficial effects. Auto-heal Penalty can be beneficial with EO Storms. Item Penalty does not prevent Serenity.")]
+    public bool AutoSerenity;
+    [PropertyDisplay("Serenity: Item Penalty")]
+    public bool SerenityOnItemPenalty = true;
+    [PropertyDisplay("Serenity: Amnesia")]
+    public bool SerenityOnAmnesia = true;
+    [PropertyDisplay("Serenity: Gloom")]
+    public bool SerenityOnGloom;
+    [PropertyDisplay("Serenity: Damage Down")]
+    public bool SerenityOnDamageDown = true;
+    [PropertyDisplay("Serenity: HP Penalty")]
+    public bool SerenityOnHPPenalty = true;
+    [PropertyDisplay("Serenity: Auto-heal Penalty")]
+    public bool SerenityOnAutoHealPenalty = true;
+    [PropertyDisplay("Use Affluence before eligible floor transitions", tooltip: "Use once before leaving for an eligible non-boss floor. May spend the last charge. Serenity and next-floor pomanders remain opt-in.")]
+    public bool AutoAffluence;
+    [PropertyDisplay("Use Flight before eligible floor transitions", tooltip: "Use once before leaving for an eligible non-boss floor. May spend the last charge. Flight halves enemies and passage kill requirements, rounded up.")]
+    public bool AutoFlight;
+    [PropertyDisplay("Use Fortune at floor start", tooltip: "Use during the first 45 seconds of an initialized non-boss floor when Fortune's item effect is not active. Mid-floor pickups wait until a later floor. May spend the last charge.")]
+    public bool AutoFortune;
+    [PropertyDisplay("Use Intuition on normal floors", tooltip: "Use once per non-boss floor when detection is not active and the current-floor hoard has not already been found. May spend the last charge. Active detection can carry across floor transitions.")]
+    public bool AutoIntuition;
 
     public override void DrawCustom(string? page, UITree tree, WorldState ws, RotationDatabase? db)
     {

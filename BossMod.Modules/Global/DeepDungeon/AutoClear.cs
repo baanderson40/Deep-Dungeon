@@ -19,6 +19,9 @@ enum SID : uint
 {
     Silence = 7,
     Pacification = 620,
+    HPPenalty = 1089,
+    DamageDown = 1090,
+    Amnesia = 1092,
     ItemPenalty = 1094,
 
     PhysicalDamageUp = 53,
@@ -81,6 +84,9 @@ public abstract partial class AutoClear : ZoneModule
     private readonly Dictionary<ulong, int> _chestContentsSilver = [];
     private readonly Dictionary<ulong, string> _lastOvercapDecision = [];
     private readonly Dictionary<PomanderID, (DateTime RequestedAt, byte Count, byte Flags)> _pendingPomanderReadbacks = [];
+    private readonly Dictionary<DeepDungeonPolicy.PomanderMaintenanceKind, DeepDungeonPolicy.PomanderMaintenanceRequest> _pomanderMaintenanceRequests = [];
+    private readonly Dictionary<DeepDungeonPolicy.PomanderMaintenanceKind, string> _lastPomanderMaintenanceDecision = [];
+    private readonly HashSet<(DeepDungeonState.DungeonType Dungeon, byte Floor, DeepDungeonPolicy.PomanderMaintenanceKind Kind)> _confirmedFloorPomanderUses = [];
     private long _lastAttributedInteractionSequence;
     private string? _lastOvercapCorrelationLogKey;
     private DateTime _lastOvercapCorrelationLogAt;
@@ -88,8 +94,14 @@ public abstract partial class AutoClear : ZoneModule
     private readonly HashSet<ulong> _fakeExits = [];
     private DeepDungeonState.PomanderState[] _lastPomanderSnapshot = [];
     private bool _pomanderSnapshotReady;
+    private string? _lastPomanderReadinessBlocker;
     private DeepDungeonState.DungeonType _observedDungeon;
     private byte _observedFloor;
+    private DeepDungeonPolicy.SafetyFloorUsage _safetyFloorUsage;
+    private DateTime _floorStartPomanderWindowAt;
+    private readonly Dictionary<ulong, DateTime> _treasureRecoveryFirstAt = [];
+    private readonly Dictionary<ulong, DateTime> _treasureRefreshAt = [];
+    private readonly Dictionary<ulong, DateTime> _deferredTreasureAt = [];
 
     private readonly List<GoalObject> InterestingObjects = [];
     private GoalObject? MostInterestingObject;
@@ -116,6 +128,10 @@ public abstract partial class AutoClear : ZoneModule
     private int _otherActorSelectionTransitions;
     private DateTime _lastTrapActivationAt;
     private string? _lastTrapActivation;
+
+    private const uint StrengthDamageUpStatus = 687;
+    private const uint StrengthHealingPotencyUpStatus = 1099;
+    private const uint SteelVulnerabilityDownStatus = 1100;
 
     private bool PassageActorGoalAllowed => DeepDungeonPolicy.ShouldAddPassageActorGoal(
         DesiredRoom.Reason != PathfindReason.Nothing,
@@ -211,6 +227,7 @@ public abstract partial class AutoClear : ZoneModule
             _bestObjectiveDistance = distance;
             _lastObjectiveProgressAt = now;
             _lastObjectiveStallLogAt = default;
+            _treasureRecoveryFirstAt.Clear();
             return;
         }
 
@@ -350,6 +367,7 @@ public abstract partial class AutoClear : ZoneModule
         {
             if (DeepDungeonPolicy.IsFloorContextReady((int)previousDungeon, previousFloor) && !BetweenFloors)
                 ClearState();
+            ResetFloorScopedNavigationRecovery();
             _floorInitializationGate.BeginTransition();
             ResetPomanderSnapshot();
             return;
@@ -357,6 +375,7 @@ public abstract partial class AutoClear : ZoneModule
 
         if (Palace.DungeonId != previousDungeon)
         {
+            ResetFloorScopedNavigationRecovery();
             if (previousDungeon != DeepDungeonState.DungeonType.None || !BetweenFloors)
                 ClearState();
             _floorInitializationGate.ObserveContextChange();
@@ -365,11 +384,23 @@ public abstract partial class AutoClear : ZoneModule
         }
         else if (Palace.Floor != previousFloor)
         {
+            ResetFloorScopedNavigationRecovery();
+            _confirmedFloorPomanderUses.RemoveWhere(use => use.Dungeon != Palace.DungeonId || use.Floor != Palace.Floor);
             if (!BetweenFloors)
                 ClearState();
             _floorInitializationGate.ObserveContextChange();
             _pendingPomanderReadbacks.Clear();
             Service.Log($"[AutoDD] floor context changed: dungeon={Palace.DungeonId}, floor={Palace.Floor}; awaiting current floor map before room initialization.");
+        }
+
+        if (Palace.DungeonId != previousDungeon)
+        {
+            foreach (var (kind, request) in _pomanderMaintenanceRequests.ToArray())
+                if (request.Dungeon != Palace.DungeonId)
+                {
+                    _pomanderMaintenanceRequests.Remove(kind);
+                    _lastPomanderMaintenanceDecision.Remove(kind);
+                }
         }
     }
 
@@ -377,6 +408,14 @@ public abstract partial class AutoClear : ZoneModule
     {
         _pomanderSnapshotReady = false;
         _pendingPomanderReadbacks.Clear();
+    }
+
+    private void ResetFloorScopedNavigationRecovery()
+    {
+        _floorStartPomanderWindowAt = default;
+        _treasureRecoveryFirstAt.Clear();
+        _treasureRefreshAt.Clear();
+        _deferredTreasureAt.Clear();
     }
 
     private void TryInitializeFloor(string cause, bool mapDataUpdate = false)
@@ -396,6 +435,7 @@ public abstract partial class AutoClear : ZoneModule
 
     protected override void Dispose(bool disposing)
     {
+        _pomanderMaintenanceRequests.Clear();
         _subscriptions.Dispose();
         _obstacles.Dispose();
         base.Dispose(disposing);
@@ -510,8 +550,33 @@ public abstract partial class AutoClear : ZoneModule
                 ClearState();
                 _floorInitializationGate.BeginTransition();
                 break;
-            case 7255: // safety used
+            case 7255: // all traps on the current floor have been removed (effect confirmation)
+                if (Palace.DungeonId != DeepDungeonState.DungeonType.None && Palace.Floor > 0)
+                {
+                    _safetyFloorUsage = DeepDungeonPolicy.ObserveSafetyFloorUsage(_safetyFloorUsage, Palace.DungeonId, Palace.Floor, effectActive: true);
+                    _confirmedFloorPomanderUses.Add((Palace.DungeonId, Palace.Floor, DeepDungeonPolicy.PomanderMaintenanceKind.Safety));
+                }
+                if (_pomanderMaintenanceRequests.TryGetValue(DeepDungeonPolicy.PomanderMaintenanceKind.Safety, out var safetyRequest)
+                    && DeepDungeonPolicy.IsMatchingSafetyUseMessage(safetyRequest, Palace.DungeonId, Palace.Floor, World.CurrentTime))
+                {
+                    _pomanderMaintenanceRequests.Remove(DeepDungeonPolicy.PomanderMaintenanceKind.Safety);
+                    Service.Log($"[AutoDD] Safety effect confirmed by system log 7255 (all traps removed): requestedFloor={safetyRequest.Floor}, stockAtRequest={safetyRequest.StockAtRequest}, stockDecrementObserved={safetyRequest.StockDecrementObserved}; stock remains separate evidence.");
+                }
+                else
+                    Service.Log($"[AutoDD] Safety effect system log 7255 not correlated: dungeon={Palace.DungeonId}, floor={Palace.Floor}; no preceding unresolved same-floor request.");
+                _trapsCurrentFloor.Clear();
+                break;
             case 7256: // sight used
+                if (Palace.DungeonId != DeepDungeonState.DungeonType.None && Palace.Floor > 0)
+                    _confirmedFloorPomanderUses.Add((Palace.DungeonId, Palace.Floor, DeepDungeonPolicy.PomanderMaintenanceKind.Sight));
+                if (_pomanderMaintenanceRequests.TryGetValue(DeepDungeonPolicy.PomanderMaintenanceKind.Sight, out var sightRequest)
+                    && DeepDungeonPolicy.IsMatchingSightUseMessage(sightRequest, Palace.DungeonId, Palace.Floor, World.CurrentTime))
+                {
+                    _pomanderMaintenanceRequests.Remove(DeepDungeonPolicy.PomanderMaintenanceKind.Sight);
+                    Service.Log($"[AutoDD] Sight use confirmed by system log 7256: requestedFloor={sightRequest.Floor}, stockAtRequest={sightRequest.StockAtRequest}, stockDecrementObserved={sightRequest.StockDecrementObserved}; stock remains separate evidence.");
+                }
+                else
+                    Service.Log($"[AutoDD] Sight use observed from system log 7256: dungeon={Palace.DungeonId}, floor={Palace.Floor}; floor use recorded even without a correlated request.");
                 _trapsCurrentFloor.Clear();
                 break;
             case 9208: // magicite overcap
@@ -564,6 +629,21 @@ public abstract partial class AutoClear : ZoneModule
 
         var pid = (PomanderID)request.Action.ID;
         var state = Palace.GetPomanderState(pid);
+        if (MaintenanceKindFor(pid) is { } kind)
+        {
+            var player = World.Party.Player();
+            bool? effectPresent = player != null ? MaintenanceEffectPresent(player, kind, state) : null;
+            if (_pomanderMaintenanceRequests.TryGetValue(kind, out var previous))
+                Service.Log($"[AutoDD] overlapping tracked pomander action request observed: item={pid}, floor={Palace.Floor}, originalFloor={previous.Floor}, originalRequestAge={(World.CurrentTime - previous.RequestedAt).TotalSeconds:F1}s, originalPhase={previous.Phase}; original verification deadline retained, source unknown.");
+            else
+            {
+                _pomanderMaintenanceRequests[kind] = new(
+                    Palace.DungeonId, Palace.Floor, pid, World.CurrentTime, state.Count, effectPresent, effectPresent == false, false,
+                    DeepDungeonPolicy.PomanderMaintenanceRequestPhase.AwaitingReadback,
+                    kind == DeepDungeonPolicy.PomanderMaintenanceKind.Serenity && player != null ? SerenityTriggerSummary(player) : null);
+                Service.Log($"[AutoDD] tracked pomander effect request observed: item={pid}, floor={Palace.Floor}, stock={state.Count}, itemEffectAtRequest={effectPresent?.ToString() ?? "unavailable"}, evidenceAtRequest={_pomanderMaintenanceRequests[kind].EvidenceAtRequest ?? "n/a"}, source=unknown; stock/effect unconfirmed.");
+            }
+        }
         if (!_pomanderSnapshotReady)
         {
             Service.Log($"[AutoDD] pomander request observed: pomander={pid}, seq={request.SourceSequence}, stock={state.Count}, usable={state.Usable}, active={state.Active}; state baseline not ready, readback correlation skipped.");
@@ -627,6 +707,289 @@ public abstract partial class AutoClear : ZoneModule
         }
     }
 
+    private static DeepDungeonPolicy.PomanderMaintenanceKind? MaintenanceKindFor(PomanderID pid) => pid switch
+    {
+        PomanderID.Strength or PomanderID.ProtoStrength => DeepDungeonPolicy.PomanderMaintenanceKind.Strength,
+        PomanderID.Steel or PomanderID.ProtoSteel => DeepDungeonPolicy.PomanderMaintenanceKind.Steel,
+        PomanderID.Raising or PomanderID.ProtoRaising => DeepDungeonPolicy.PomanderMaintenanceKind.Raising,
+        PomanderID.Safety or PomanderID.ProtoSafety => DeepDungeonPolicy.PomanderMaintenanceKind.Safety,
+        PomanderID.Sight or PomanderID.ProtoSight => DeepDungeonPolicy.PomanderMaintenanceKind.Sight,
+        PomanderID.Serenity or PomanderID.ProtoSerenity => DeepDungeonPolicy.PomanderMaintenanceKind.Serenity,
+        PomanderID.Fortune or PomanderID.ProtoFortune => DeepDungeonPolicy.PomanderMaintenanceKind.Fortune,
+        PomanderID.Intuition or PomanderID.ProtoIntuition => DeepDungeonPolicy.PomanderMaintenanceKind.Intuition,
+        PomanderID.Affluence or PomanderID.ProtoAffluence => DeepDungeonPolicy.PomanderMaintenanceKind.Affluence,
+        PomanderID.Flight or PomanderID.ProtoFlight => DeepDungeonPolicy.PomanderMaintenanceKind.Flight,
+        _ => null,
+    };
+
+    private PomanderID MaintenancePomander(DeepDungeonPolicy.PomanderMaintenanceKind kind)
+        => DeepDungeonPolicy.MaintenancePomander(Palace.DungeonId, kind);
+
+    private bool? MaintenanceEffectPresent(Actor player, DeepDungeonPolicy.PomanderMaintenanceKind kind, DeepDungeonState.PomanderState itemState)
+    {
+        if (kind == DeepDungeonPolicy.PomanderMaintenanceKind.Serenity)
+            return SerenityEffectEvidence(player);
+        if (kind == DeepDungeonPolicy.PomanderMaintenanceKind.Safety)
+            return false; // use is confirmed by system log 7255, not the item Active bit.
+        return DeepDungeonPolicy.PomanderMaintenanceEffectPresent(
+            kind,
+            player.FindStatus(StrengthDamageUpStatus) != null,
+            player.FindStatus(StrengthHealingPotencyUpStatus) != null,
+            player.FindStatus(SteelVulnerabilityDownStatus) != null,
+            itemState.Active,
+            itemState.Active);
+    }
+
+    private bool? CurrentFloorGloom => DeepDungeonPolicy.CurrentFloorGloom(Palace.FloorEffectsSnapshot, Palace.DungeonId, Palace.Floor);
+    private bool CurrentFloorGloomKnown => CurrentFloorGloom != null;
+    private bool CurrentFloorGloomPresent => CurrentFloorGloom == true;
+
+    private bool SerenityTriggerPresent(Actor player)
+        => DeepDungeonPolicy.IsEnabledSerenityTrigger(
+            player.FindStatus(SID.ItemPenalty) != null,
+            player.FindStatus(SID.Amnesia) != null,
+            CurrentFloorGloomPresent,
+            player.FindStatus(SID.DamageDown) != null,
+            player.FindStatus(SID.HPPenalty) != null,
+            player.FindStatus(SID.AutoHealPenalty) != null,
+            _config.SerenityOnItemPenalty, _config.SerenityOnAmnesia, _config.SerenityOnGloom,
+            _config.SerenityOnDamageDown, _config.SerenityOnHPPenalty, _config.SerenityOnAutoHealPenalty);
+
+    private bool? SerenityEffectEvidence(Actor player)
+    {
+        if (SerenityTriggerPresent(player))
+            return false;
+        if (_config.SerenityOnGloom && CurrentFloorGloom == null)
+            return null;
+        return true;
+    }
+
+    private string SerenityTriggerSummary(Actor player)
+    {
+        var statuses = new (string Name, bool Present, bool Selected)[]
+        {
+            ("ItemPenalty", player.FindStatus(SID.ItemPenalty) != null, _config.SerenityOnItemPenalty),
+            ("Amnesia", player.FindStatus(SID.Amnesia) != null, _config.SerenityOnAmnesia),
+            ("Gloom", CurrentFloorGloomPresent, _config.SerenityOnGloom),
+            ("DamageDown", player.FindStatus(SID.DamageDown) != null, _config.SerenityOnDamageDown),
+            ("HPPenalty", player.FindStatus(SID.HPPenalty) != null, _config.SerenityOnHPPenalty),
+            ("AutoHealPenalty", player.FindStatus(SID.AutoHealPenalty) != null, _config.SerenityOnAutoHealPenalty),
+        };
+        var present = string.Join(",", statuses.Where(s => s.Present).Select(s => s.Name));
+        var selected = string.Join(",", statuses.Where(s => s.Selected).Select(s => s.Name));
+        var floorEffects = Palace.FloorEffectsSnapshot;
+        return $"AutoSerenity={_config.AutoSerenity},present=[{present}],selected=[{selected}],selectedPresent=[{string.Join(",", statuses.Where(s => s.Present && s.Selected).Select(s => s.Name))}],floorEffectsKnown={floorEffects.Known && floorEffects.Dungeon == Palace.DungeonId && floorEffects.Floor == Palace.Floor},gloomKnown={CurrentFloorGloomKnown},gloom={floorEffects.Gloom},effectIDs={floorEffects.StatusID}/{floorEffects.BanID}/{floorEffects.DangerID}";
+    }
+
+    private void ReconcilePomanderMaintenance(Actor player)
+    {
+        foreach (var (kind, request) in _pomanderMaintenanceRequests.ToArray())
+        {
+            if (Palace.DungeonId != request.Dungeon || DeepDungeonPolicy.MaintenancePomander(request.Dungeon, kind) != request.Pomander)
+                continue;
+
+            var current = Palace.GetPomanderState(request.Pomander);
+            if (Palace.Floor != request.Floor)
+            {
+                if (kind == DeepDungeonPolicy.PomanderMaintenanceKind.Intuition && current.Active)
+                {
+                    _confirmedFloorPomanderUses.Add((Palace.DungeonId, Palace.Floor, kind));
+                    _pomanderMaintenanceRequests.Remove(kind);
+                    Service.Log($"[AutoDD] Intuition detection active after floor transition: requestedFloor={request.Floor}, currentFloor={Palace.Floor}; active effect suppresses reuse, stock remains separate evidence.");
+                    continue;
+                }
+                // A floor transition is not evidence that a current-floor effect was removed or a next-floor effect prepared.
+                var stale = DeepDungeonPolicy.ObservePomanderMaintenanceRequest(request, current.Count, false, World.CurrentTime);
+                if (stale != request)
+                {
+                    _pomanderMaintenanceRequests[kind] = stale;
+                    if (stale.Phase == DeepDungeonPolicy.PomanderMaintenanceRequestPhase.OutcomeUnknown)
+                        Service.Log($"[AutoDD] pomander outcome unknown after floor transition: item={request.Pomander}, requestedFloor={request.Floor}, currentFloor={Palace.Floor}; transition is not effect evidence, retries on the requested floor remain blocked.");
+                }
+                // One-shot floor uses are scoped to one floor. Preserve the unknown result in this
+                // floor's log, but don't let it block a new, independent use on a later floor.
+                if (Palace.Floor > 0 && DeepDungeonPolicy.IsFloorScopedMaintenanceKind(kind))
+                {
+                    Service.Log($"[AutoDD] prior-floor one-shot request retired from active checks: item={request.Pomander}, requestedFloor={request.Floor}, currentFloor={Palace.Floor}, phase={stale.Phase}, stockDecrementObserved={stale.StockDecrementObserved}, evidenceAtRequest={request.EvidenceAtRequest ?? "n/a"}; old-floor outcome remains unconfirmed, current-floor use is independent.");
+                    _pomanderMaintenanceRequests.Remove(kind);
+                }
+                continue;
+            }
+            var effectPresent = MaintenanceEffectPresent(player, kind, current);
+            var updated = DeepDungeonPolicy.ObservePomanderMaintenanceRequest(request, current.Count, effectPresent, World.CurrentTime);
+            if (updated.Phase == DeepDungeonPolicy.PomanderMaintenanceRequestPhase.Resolved)
+            {
+                _pomanderMaintenanceRequests.Remove(kind);
+                if (kind is DeepDungeonPolicy.PomanderMaintenanceKind.Serenity or DeepDungeonPolicy.PomanderMaintenanceKind.Fortune or DeepDungeonPolicy.PomanderMaintenanceKind.Intuition or DeepDungeonPolicy.PomanderMaintenanceKind.Affluence or DeepDungeonPolicy.PomanderMaintenanceKind.Flight)
+                    _confirmedFloorPomanderUses.Add((request.Dungeon, request.Floor, kind));
+                    Service.Log($"[AutoDD] pomander item effect observed after request: item={request.Pomander}, requestedFloor={request.Floor}, evidence={MaintenanceEffectLabel(kind)}, effectAtRequest={request.EffectPresentAtRequest?.ToString() ?? "unavailable"}, evidenceAtRequest={request.EvidenceAtRequest ?? "n/a"}, effectWasAbsentAfterRequest={updated.EffectWasAbsentAfterRequest}, stockAtRequest={request.StockAtRequest}, stockNow={current.Count}; source/causation unconfirmed.");
+            }
+            else if (updated != request)
+            {
+                _pomanderMaintenanceRequests[kind] = updated;
+                if (updated.Phase == DeepDungeonPolicy.PomanderMaintenanceRequestPhase.OutcomeUnknown)
+                    Service.Log($"[AutoDD] pomander outcome unknown: item={request.Pomander}, requestedFloor={request.Floor}, stockAtRequest={request.StockAtRequest}, stockNow={current.Count}, stockDecrementObserved={updated.StockDecrementObserved}, itemEffectAtRequest={request.EffectPresentAtRequest?.ToString() ?? "unavailable"}, itemEffectNow={effectPresent}, evidenceAtRequest={request.EvidenceAtRequest ?? "n/a"}; same-floor same-item maintenance remains blocked until later effect evidence.");
+                else if (updated.StockDecrementObserved)
+                    Service.Log($"[AutoDD] pomander stock decrement observed: item={request.Pomander}, stock={request.StockAtRequest}->{current.Count}; awaiting item-effect evidence; source/causation unconfirmed.");
+            }
+        }
+    }
+
+    private static string MaintenanceEffectLabel(DeepDungeonPolicy.PomanderMaintenanceKind kind) => kind switch
+    {
+        DeepDungeonPolicy.PomanderMaintenanceKind.Strength => "player status 687/1099",
+        DeepDungeonPolicy.PomanderMaintenanceKind.Steel => "player status 1100",
+        DeepDungeonPolicy.PomanderMaintenanceKind.Raising => "Raising item Active flag",
+        DeepDungeonPolicy.PomanderMaintenanceKind.Safety => "system log 7255: all traps removed",
+        DeepDungeonPolicy.PomanderMaintenanceKind.Sight => "system log 7256: Sight used",
+        DeepDungeonPolicy.PomanderMaintenanceKind.Serenity => "selected enchantments cleared",
+        DeepDungeonPolicy.PomanderMaintenanceKind.Fortune => "Fortune item Active flag",
+        DeepDungeonPolicy.PomanderMaintenanceKind.Intuition => "Intuition item Active flag",
+        DeepDungeonPolicy.PomanderMaintenanceKind.Affluence => "next-floor Affluence item Active flag",
+        DeepDungeonPolicy.PomanderMaintenanceKind.Flight => "next-floor Flight item Active flag",
+        _ => "unknown",
+    };
+
+    private void LogPomanderMaintenanceDecision(DeepDungeonPolicy.PomanderMaintenanceKind kind, PomanderID pid, DeepDungeonState.PomanderState state, bool bossFloor, string reason, string? detail = null)
+    {
+        var decision = $"{Palace.Floor}/{pid}/{bossFloor}/{state.Count}/{state.Usable}/{reason}/{detail}";
+        if (_lastPomanderMaintenanceDecision.TryGetValue(kind, out var previous) && previous == decision)
+            return;
+        _lastPomanderMaintenanceDecision[kind] = decision;
+        var reserve = kind is DeepDungeonPolicy.PomanderMaintenanceKind.Raising or DeepDungeonPolicy.PomanderMaintenanceKind.Safety or DeepDungeonPolicy.PomanderMaintenanceKind.Sight or DeepDungeonPolicy.PomanderMaintenanceKind.Serenity or DeepDungeonPolicy.PomanderMaintenanceKind.Fortune or DeepDungeonPolicy.PomanderMaintenanceKind.Intuition or DeepDungeonPolicy.PomanderMaintenanceKind.Affluence or DeepDungeonPolicy.PomanderMaintenanceKind.Flight || bossFloor ? 0 : 1;
+        Service.Log($"[AutoDD] pomander maintenance candidate: item={pid}, floor={Palace.Floor}, boss={bossFloor}, stock={state.Count}, usable={state.Usable}, reserve={reserve}, result={reason}{(detail != null ? $", {detail}" : "")}.");
+    }
+
+    private void TryQueuePomanderMaintenance(Actor player, AIHints hints, bool bossFloor, bool departureIntent = false)
+    {
+        if (!_config.Enable || BetweenFloors || !_pomanderSnapshotReady)
+            return;
+
+        var readinessBlocker = DeepDungeonPolicy.PomanderSchedulingReadinessBlocker(
+            player.InstanceID != 0,
+            Service.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.BetweenAreas],
+            Service.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.BetweenAreas51],
+            Utils.IsScreenReady());
+        if (readinessBlocker != _lastPomanderReadinessBlocker)
+        {
+            if (readinessBlocker != null)
+                Service.Log($"[AutoDD] pomander maintenance blocked: {readinessBlocker}; no action request queued.");
+            else if (_lastPomanderReadinessBlocker != null)
+                Service.Log("[AutoDD] pomander maintenance unblocked: local player ready.");
+            _lastPomanderReadinessBlocker = readinessBlocker;
+        }
+        if (readinessBlocker != null)
+            return;
+
+        // Start the bounded arrival window only once map, inventory baseline, and local player are usable.
+        _floorStartPomanderWindowAt = _floorStartPomanderWindowAt == default ? World.CurrentTime : _floorStartPomanderWindowAt;
+
+        foreach (var kind in new[] { DeepDungeonPolicy.PomanderMaintenanceKind.Serenity, DeepDungeonPolicy.PomanderMaintenanceKind.Safety, DeepDungeonPolicy.PomanderMaintenanceKind.Sight, DeepDungeonPolicy.PomanderMaintenanceKind.Raising, DeepDungeonPolicy.PomanderMaintenanceKind.Steel, DeepDungeonPolicy.PomanderMaintenanceKind.Strength, DeepDungeonPolicy.PomanderMaintenanceKind.Fortune, DeepDungeonPolicy.PomanderMaintenanceKind.Intuition, DeepDungeonPolicy.PomanderMaintenanceKind.Affluence, DeepDungeonPolicy.PomanderMaintenanceKind.Flight })
+        {
+            var serenityTriggerPresent = kind == DeepDungeonPolicy.PomanderMaintenanceKind.Serenity && SerenityTriggerPresent(player);
+            var configured = kind switch
+            {
+                DeepDungeonPolicy.PomanderMaintenanceKind.Serenity => _config.AutoSerenity,
+                DeepDungeonPolicy.PomanderMaintenanceKind.Raising => _config.MaintainRaising,
+                DeepDungeonPolicy.PomanderMaintenanceKind.Safety => _config.AutoSafety,
+                DeepDungeonPolicy.PomanderMaintenanceKind.Sight => _config.AutoSight,
+                DeepDungeonPolicy.PomanderMaintenanceKind.Steel => _config.MaintainSteel,
+                DeepDungeonPolicy.PomanderMaintenanceKind.Strength => _config.MaintainStrength,
+                DeepDungeonPolicy.PomanderMaintenanceKind.Fortune => _config.AutoFortune,
+                DeepDungeonPolicy.PomanderMaintenanceKind.Intuition => _config.AutoIntuition,
+                DeepDungeonPolicy.PomanderMaintenanceKind.Affluence => DeepDungeonPolicy.IsPreparingNextFloorPomander(_config.AutoAffluence, Palace.PassageActive, departureIntent, !player.IsDead, player.InCombat, _pomanderSnapshotReady, Palace.DungeonId, Palace.Floor),
+                DeepDungeonPolicy.PomanderMaintenanceKind.Flight => DeepDungeonPolicy.IsPreparingNextFloorPomander(_config.AutoFlight, Palace.PassageActive, departureIntent, !player.IsDead, player.InCombat, _pomanderSnapshotReady, Palace.DungeonId, Palace.Floor),
+                _ => false,
+            };
+            if (kind is DeepDungeonPolicy.PomanderMaintenanceKind.Fortune or DeepDungeonPolicy.PomanderMaintenanceKind.Safety or DeepDungeonPolicy.PomanderMaintenanceKind.Sight)
+                configured = DeepDungeonPolicy.IsFloorStartPomanderEligible(configured, bossFloor, !BetweenFloors && _pomanderSnapshotReady, _floorStartPomanderWindowAt, World.CurrentTime);
+            var pid = MaintenancePomander(kind);
+            var slot = pid != PomanderID.None ? Palace.GetPomanderSlot(pid) : -1;
+            var validSlot = slot is >= 0 and < DeepDungeonState.NumPomanderSlots;
+            var state = validSlot ? Palace.Pomanders[slot] : default;
+            if (kind == DeepDungeonPolicy.PomanderMaintenanceKind.Safety)
+                _safetyFloorUsage = DeepDungeonPolicy.ObserveSafetyFloorUsage(_safetyFloorUsage, Palace.DungeonId, Palace.Floor, effectActive: false);
+            var effectActive = kind switch
+            {
+                // Serenity is eligible only while a selected trigger is present.
+                DeepDungeonPolicy.PomanderMaintenanceKind.Serenity => !serenityTriggerPresent,
+                _ => MaintenanceEffectPresent(player, kind, state) == true,
+            };
+            var oneShotPerFloor = kind is DeepDungeonPolicy.PomanderMaintenanceKind.Safety or DeepDungeonPolicy.PomanderMaintenanceKind.Sight or DeepDungeonPolicy.PomanderMaintenanceKind.Serenity or DeepDungeonPolicy.PomanderMaintenanceKind.Fortune or DeepDungeonPolicy.PomanderMaintenanceKind.Intuition or DeepDungeonPolicy.PomanderMaintenanceKind.Affluence or DeepDungeonPolicy.PomanderMaintenanceKind.Flight;
+            var alreadyUsedThisFloor = oneShotPerFloor && _confirmedFloorPomanderUses.Contains((Palace.DungeonId, Palace.Floor, kind));
+            if (kind is DeepDungeonPolicy.PomanderMaintenanceKind.Fortune or DeepDungeonPolicy.PomanderMaintenanceKind.Intuition && state.Active)
+            {
+                alreadyUsedThisFloor = true;
+                _confirmedFloorPomanderUses.Add((Palace.DungeonId, Palace.Floor, kind));
+            }
+            if (kind is DeepDungeonPolicy.PomanderMaintenanceKind.Affluence or DeepDungeonPolicy.PomanderMaintenanceKind.Flight && state.Active)
+            {
+                alreadyUsedThisFloor = true;
+                _confirmedFloorPomanderUses.Add((Palace.DungeonId, Palace.Floor, kind));
+            }
+            var hasRequest = _pomanderMaintenanceRequests.TryGetValue(kind, out var pending);
+            var unknown = hasRequest && pending.Phase == DeepDungeonPolicy.PomanderMaintenanceRequestPhase.OutcomeUnknown;
+            var ownPending = hasRequest && DeepDungeonPolicy.IsBlockingPomanderMaintenanceRequest(pending.Phase);
+            var waitingForOther = DeepDungeonPolicy.HasBlockingPomanderMaintenanceRequest(_pomanderMaintenanceRequests, kind);
+            var pendingRequest = ownPending || waitingForOther;
+            var safetyUsedThisFloor = _confirmedFloorPomanderUses.Contains((Palace.DungeonId, Palace.Floor, DeepDungeonPolicy.PomanderMaintenanceKind.Safety)) || _safetyFloorUsage is { } safetyUsage && safetyUsage.Dungeon == Palace.DungeonId && safetyUsage.Floor == Palace.Floor && safetyUsage.Used;
+            var sightUsedThisFloor = _confirmedFloorPomanderUses.Contains((Palace.DungeonId, Palace.Floor, DeepDungeonPolicy.PomanderMaintenanceKind.Sight));
+            var safetyRequestUnresolved = _pomanderMaintenanceRequests.TryGetValue(DeepDungeonPolicy.PomanderMaintenanceKind.Safety, out var trackedSafety)
+                && trackedSafety.Dungeon == Palace.DungeonId && trackedSafety.Floor == Palace.Floor && trackedSafety.Phase != DeepDungeonPolicy.PomanderMaintenanceRequestPhase.Resolved;
+            var sightRequestUnresolved = _pomanderMaintenanceRequests.TryGetValue(DeepDungeonPolicy.PomanderMaintenanceKind.Sight, out var trackedSight)
+                && trackedSight.Dungeon == Palace.DungeonId && trackedSight.Floor == Palace.Floor && trackedSight.Phase != DeepDungeonPolicy.PomanderMaintenanceRequestPhase.Resolved;
+            var safetySlotForSight = Palace.GetPomanderSlot(MaintenancePomander(DeepDungeonPolicy.PomanderMaintenanceKind.Safety));
+            var safetyAvailableForSight = safetySlotForSight is >= 0 and < DeepDungeonState.NumPomanderSlots
+                && Palace.Pomanders[safetySlotForSight].Count > 0 && Palace.Pomanders[safetySlotForSight].Usable;
+            var solo = Palace.Party.Count(member => member.EntityId > 0) <= 1;
+            var eligible = DeepDungeonPolicy.CanMaintainPomander(
+                configured, _config.Enable, !BetweenFloors && _pomanderSnapshotReady, !player.IsDead, solo,
+                !DeepDungeonPolicy.SerenityMayIgnoreItemPenalty(kind) && player.FindStatus(SID.ItemPenalty) != null,
+                validSlot, state.Count, state.Usable, bossFloor,
+                kind is DeepDungeonPolicy.PomanderMaintenanceKind.Raising or DeepDungeonPolicy.PomanderMaintenanceKind.Safety or DeepDungeonPolicy.PomanderMaintenanceKind.Sight or DeepDungeonPolicy.PomanderMaintenanceKind.Serenity or DeepDungeonPolicy.PomanderMaintenanceKind.Fortune or DeepDungeonPolicy.PomanderMaintenanceKind.Intuition or DeepDungeonPolicy.PomanderMaintenanceKind.Affluence or DeepDungeonPolicy.PomanderMaintenanceKind.Flight,
+                kind is DeepDungeonPolicy.PomanderMaintenanceKind.Safety or DeepDungeonPolicy.PomanderMaintenanceKind.Sight or DeepDungeonPolicy.PomanderMaintenanceKind.Serenity or DeepDungeonPolicy.PomanderMaintenanceKind.Fortune or DeepDungeonPolicy.PomanderMaintenanceKind.Intuition,
+                kind == DeepDungeonPolicy.PomanderMaintenanceKind.Safety && safetyUsedThisFloor || alreadyUsedThisFloor,
+                effectActive, pendingRequest, unknown, out var reason);
+            if (kind == DeepDungeonPolicy.PomanderMaintenanceKind.Intuition && Palace.Progress.HoardCurrentFloor)
+            {
+                eligible = false;
+                reason = "current-floor hoard already found";
+            }
+            if (kind == DeepDungeonPolicy.PomanderMaintenanceKind.Sight
+                && DeepDungeonPolicy.ShouldSuppressSightForSafety(safetyUsedThisFloor, safetyRequestUnresolved, _config.AutoSafety, safetyAvailableForSight))
+            {
+                eligible = false;
+                reason = safetyUsedThisFloor ? "Safety used this floor"
+                    : safetyRequestUnresolved ? "Safety request pending or outcome unknown"
+                    : "Safety preferred";
+            }
+            if (kind == DeepDungeonPolicy.PomanderMaintenanceKind.Safety
+                && DeepDungeonPolicy.ShouldSuppressSafetyForSight(sightUsedThisFloor, sightRequestUnresolved))
+            {
+                eligible = false;
+                reason = sightUsedThisFloor ? "Sight used this floor" : "Sight request pending or outcome unknown";
+            }
+            if (kind == DeepDungeonPolicy.PomanderMaintenanceKind.Serenity && configured && !serenityTriggerPresent && !unknown && !pendingRequest)
+                reason = "no selected enchantment detected";
+            if (waitingForOther)
+            {
+                var other = _pomanderMaintenanceRequests.First(entry => entry.Key != kind && DeepDungeonPolicy.IsBlockingPomanderMaintenanceRequest(entry.Value.Phase));
+                reason = $"waiting for {other.Value.Pomander} readback";
+            }
+            LogPomanderMaintenanceDecision(kind, pid, state, bossFloor, reason,
+                kind == DeepDungeonPolicy.PomanderMaintenanceKind.Serenity ? SerenityTriggerSummary(player) : null);
+            if (!eligible)
+                continue;
+
+            var action = new ActionID(ActionType.Pomander, (uint)pid);
+            if (hints.ActionsToExecute.Entries.Any(entry => entry.Action.Type == ActionType.Pomander))
+                return; // An overcap/manual pomander proposal already owns this action slot for this frame.
+
+            hints.ActionsToExecute.Push(action, null, ActionQueue.Priority.Low);
+            return;
+        }
+    }
+
     private void OnEObjAnim(Actor actor, ushort p1, ushort p2)
     {
         // fake beacon deactivation; accompanied by system log #9217 but it does not indicate a specific actor
@@ -655,6 +1018,10 @@ public abstract partial class AutoClear : ZoneModule
         _chestContentsSilver.Clear();
         World.DeepDungeonInteractions.Clear();
         _lastAttributedInteractionSequence = 0;
+        _floorStartPomanderWindowAt = default;
+        _treasureRecoveryFirstAt.Clear();
+        _treasureRefreshAt.Clear();
+        _deferredTreasureAt.Clear();
         _lastOvercapCorrelationLogKey = null;
         _lastOvercapCorrelationLogAt = default;
         _suppressedOvercapCorrelationLogs = 0;
@@ -721,7 +1088,7 @@ public abstract partial class AutoClear : ZoneModule
             state = Palace.Pomanders[slot];
 
         var requiresPox = p is PomanderID.Purity or PomanderID.ProtoPurity;
-        return DeepDungeonPolicy.CanAutoUsePomander(
+        var eligible = DeepDungeonPolicy.CanAutoUsePomander(
             validDungeonAndAction,
             validSlot,
             state.Count,
@@ -732,7 +1099,57 @@ public abstract partial class AutoClear : ZoneModule
             requiresPox,
             !requiresPox || player.FindStatus(1087) != null,
             out reason);
+        if (!eligible || MaintenanceKindFor(p) is not { } kind)
+            return eligible;
+
+        var usedThisFloor = _confirmedFloorPomanderUses.Contains((Palace.DungeonId, Palace.Floor, kind));
+        var requestUnresolved = HasCurrentUnresolvedPomanderRequest(kind);
+        if (kind is DeepDungeonPolicy.PomanderMaintenanceKind.Fortune or DeepDungeonPolicy.PomanderMaintenanceKind.Intuition)
+        {
+            if (state.Active)
+                reason = "effect active";
+            else if (usedThisFloor || requestUnresolved)
+                reason = usedThisFloor ? "already used this floor" : "request pending or outcome unknown";
+            else if (kind == DeepDungeonPolicy.PomanderMaintenanceKind.Intuition && Palace.Progress.HoardCurrentFloor)
+                reason = "current-floor hoard already found";
+            else
+                return true;
+            return false;
+        }
+
+        if (kind is DeepDungeonPolicy.PomanderMaintenanceKind.Safety or DeepDungeonPolicy.PomanderMaintenanceKind.Sight)
+        {
+            var safetyKind = DeepDungeonPolicy.PomanderMaintenanceKind.Safety;
+            var sightKind = DeepDungeonPolicy.PomanderMaintenanceKind.Sight;
+            var safetyUsed = _confirmedFloorPomanderUses.Contains((Palace.DungeonId, Palace.Floor, safetyKind))
+                || _safetyFloorUsage.Dungeon == Palace.DungeonId && _safetyFloorUsage.Floor == Palace.Floor && _safetyFloorUsage.Used;
+            var sightUsed = _confirmedFloorPomanderUses.Contains((Palace.DungeonId, Palace.Floor, sightKind));
+            var safetySlot = Palace.GetPomanderSlot(MaintenancePomander(safetyKind));
+            var safetyState = safetySlot is >= 0 and < DeepDungeonState.NumPomanderSlots ? Palace.Pomanders[safetySlot] : default;
+            var safetyAvailable = safetyState.Count > 0 && safetyState.Usable;
+            var safetyRequest = HasCurrentUnresolvedPomanderRequest(safetyKind);
+            var sightRequest = HasCurrentUnresolvedPomanderRequest(sightKind);
+            if (kind == safetyKind && (safetyUsed || safetyRequest))
+                reason = safetyUsed ? "already used this floor" : "request pending or outcome unknown";
+            else if (kind == sightKind && (sightUsed || sightRequest))
+                reason = sightUsed ? "already used this floor" : "request pending or outcome unknown";
+            else if (kind == safetyKind && DeepDungeonPolicy.ShouldSuppressSafetyForSight(sightUsed, sightRequest))
+                reason = sightUsed ? "Sight used this floor" : "Sight request pending or outcome unknown";
+            else if (kind == sightKind && DeepDungeonPolicy.ShouldSuppressSightForSafety(safetyUsed, safetyRequest, _config.Enable && _config.AutoSafety, safetyAvailable))
+                reason = safetyUsed ? "Safety used this floor"
+                    : safetyRequest ? "Safety request pending or outcome unknown"
+                    : "Safety preferred";
+            else
+                return true;
+            return false;
+        }
+        return true;
     }
+
+    private bool HasCurrentUnresolvedPomanderRequest(DeepDungeonPolicy.PomanderMaintenanceKind kind)
+        => _pomanderMaintenanceRequests.TryGetValue(kind, out var request)
+            && request.Dungeon == Palace.DungeonId && request.Floor == Palace.Floor
+            && request.Phase != DeepDungeonPolicy.PomanderMaintenanceRequestPhase.Resolved;
 
     private void LogOvercapDecision(Actor chest, PomanderID pid, bool accepted, string reason, DeepDungeonState.PomanderState state)
     {
@@ -774,6 +1191,7 @@ public abstract partial class AutoClear : ZoneModule
         LogEnableState();
         TryInitializeFloor("AI hint update");
         ExpirePomanderReadbacks();
+        ReconcilePomanderMaintenance(player);
         if (!_config.Enable)
         {
             MostInterestingObject = null;
@@ -798,6 +1216,8 @@ public abstract partial class AutoClear : ZoneModule
 
         if (Palace.IsBossFloor || BetweenFloors)
         {
+            if (Palace.IsBossFloor && !BetweenFloors)
+                TryQueuePomanderMaintenance(player, hints, bossFloor: true, departureIntent: Palace.PassageActive && !player.InCombat);
             var blocker = Palace.IsBossFloor ? "boss floor" : "between floors / map not initialized";
             LogAutoDDBlocker(blocker);
             ResetObjectiveProgress(blocker);
@@ -829,6 +1249,7 @@ public abstract partial class AutoClear : ZoneModule
         if (!geometryReady)
         {
             MostInterestingObject = null;
+            TryQueuePomanderMaintenance(player, hints, bossFloor: false);
             LogAutoDDBlocker($"room geometry unavailable: {geometryReason}");
             foreach (var actor in World.Actors)
                 if (RevealedTrapOIDs.Contains(actor.OID))
@@ -841,6 +1262,7 @@ public abstract partial class AutoClear : ZoneModule
 
         if (!TryFindClosestRoom(player.Position, out var playerRoom))
         {
+            TryQueuePomanderMaintenance(player, hints, bossFloor: false);
             LogAutoDDBlocker("player room could not be resolved from current geometry");
             ResetObjectiveProgress("player room unavailable");
             return;
@@ -935,9 +1357,18 @@ public abstract partial class AutoClear : ZoneModule
 
         PickARoom(player, hints);
 
+        var now = World.CurrentTime;
+        foreach (var actorID in _deferredTreasureAt.Keys.ToArray())
+            if (!DeepDungeonPolicy.IsTreasureDeferred(_deferredTreasureAt[actorID], now))
+                _deferredTreasureAt.Remove(actorID);
+        InterestingObjects.RemoveAll(o => o.Type == GoalType.Treasure
+            && (_deferredTreasureAt.TryGetValue(o.Actor.InstanceID, out var deferredAt) && DeepDungeonPolicy.IsTreasureDeferred(deferredAt, now)
+                || _treasureRefreshAt.TryGetValue(o.Actor.InstanceID, out var refreshAt) && DeepDungeonPolicy.IsTreasureRefreshSuppressed(refreshAt, now)));
+
         InterestingObjects.SortBy(o => (o.Type, o.PlayerDistSq));
 
         MostInterestingObject = InterestingObjects.FirstOrNull(o => DeepDungeonPolicy.ShouldConsiderActorForNavigation(o.Type == GoalType.Passage, PassageActorGoalAllowed));
+        UpdateTreasureOscillationRecovery(player, hints, canNavigate, manualNavigation);
         LogSelectedActorGoal(player);
 
         LogAutoDDBlocker(canNavigate ? null : $"pull limit reached ({numAggro}/{_config.MaxPull})");
@@ -956,11 +1387,15 @@ public abstract partial class AutoClear : ZoneModule
 
                 case { Type: GoalType.Hoard, Actor: var h }:
                     hints.AddGoalZone(AIHints.GoalSingleTarget(h.Position, 2, 10), $"deepdungeon-hoard:{h.InstanceID}");
+                    hints.AddGoalZone(DeepDungeonPolicy.HoardProgressGoal(h.Position, player.Position, 100, 1, 10), $"deepdungeon-hoard:{h.InstanceID}:progress");
                     break;
 
                 case { IsTreasure: true, Actor: var d }:
-                    hints.AddGoalZone(AIHints.GoalSingleTarget(d.Position, 25, DeepDungeonPolicy.TreasureApproachWeight(player.InCombat)), $"deepdungeon-treasure:{d.InstanceID}");
-                    hints.InteractWithTarget = d;
+                    hints.AddGoalZone(AIHints.GoalSingleTarget(d.Position, 2, DeepDungeonPolicy.TreasureApproachWeight(player.InCombat)), $"deepdungeon-treasure:{d.InstanceID}:interact-range");
+                    hints.AddGoalZone(DeepDungeonPolicy.TreasureProgressGoal(d.Position, player.Position, 100, 1, DeepDungeonPolicy.TreasureApproachWeight(player.InCombat)), $"deepdungeon-treasure:{d.InstanceID}:progress");
+                    hints.DeepDungeonTreasureGoalID = d.InstanceID;
+                    if ((player.Position - d.Position).LengthSq() <= 3.5f * 3.5f)
+                        hints.InteractWithTarget = d;
                     break;
             }
         }
@@ -997,6 +1432,46 @@ public abstract partial class AutoClear : ZoneModule
         }
 
         LogObjectiveProgress(player, hints, numAggro, canNavigate);
+        TryQueuePomanderMaintenance(player, hints, bossFloor: false, departureIntent: Palace.PassageActive && DesiredRoom.Reason == PathfindReason.OpenPassage);
+    }
+
+    private void UpdateTreasureOscillationRecovery(Actor player, AIHints hints, bool canNavigate, bool manualNavigation)
+    {
+        var actorID = hints.DeepDungeonOscillatingTreasureID;
+        var signalFloor = hints.DeepDungeonOscillationFloor;
+        var signalAt = hints.DeepDungeonOscillationAt;
+        // Consume the latched signal; a fresh oscillation must be reported by movement again.
+        hints.DeepDungeonOscillatingTreasureID = 0;
+        hints.DeepDungeonOscillationFloor = 0;
+        hints.DeepDungeonOscillationAt = default;
+        if (!canNavigate || manualNavigation || player.InCombat || player.CastInfo != null || MostInterestingObject is not { IsTreasure: true } selected
+            || selected.Actor.InstanceID != actorID || signalFloor != Palace.Floor || signalAt == default || World.CurrentTime < signalAt || World.CurrentTime - signalAt > TimeSpan.FromSeconds(10))
+            return;
+
+        var now = World.CurrentTime;
+        var noProgressFor = _lastObjectiveProgressAt == default ? TimeSpan.Zero : now - _lastObjectiveProgressAt;
+        var inInteractionRange = MathF.Sqrt(selected.PlayerDistSq) <= 3.5f;
+        if (!DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, noProgressFor,
+            DesiredRoom.Reason != PathfindReason.Nothing, manualNavigation, player.InCombat, player.CastInfo != null, inInteractionRange))
+            return;
+
+        if (!_treasureRecoveryFirstAt.TryGetValue(actorID, out var firstAt)
+            || now < firstAt || now - firstAt > TimeSpan.FromSeconds(30))
+        {
+            _treasureRecoveryFirstAt[actorID] = now;
+            _treasureRefreshAt[actorID] = now;
+            Service.Log($"[AutoDD] treasure oscillation recovery: actor={actorID}, action=briefly release treasure goal to rebuild route, noProgressFor={noProgressFor.TotalSeconds:F0}s; hazards and room objective remain active.");
+            return;
+        }
+        if (!DeepDungeonPolicy.IsTreasureRecoveryReady(firstAt, now))
+            return;
+
+        _deferredTreasureAt[actorID] = now;
+        _treasureRecoveryFirstAt.Remove(actorID);
+        _treasureRefreshAt.Remove(actorID);
+        MostInterestingObject = InterestingObjects.FirstOrNull(o => o.Actor.InstanceID != actorID
+            && DeepDungeonPolicy.ShouldConsiderActorForNavigation(o.Type == GoalType.Passage, PassageActorGoalAllowed));
+        Service.Log($"[AutoDD] treasure oscillation recovery: actor={actorID}, action=defer chest for {DeepDungeonPolicy.TreasureRecoveryCooldown.TotalSeconds:F0}s and resume room objective; noProgressFor={noProgressFor.TotalSeconds:F0}s. No hazard zones changed.");
     }
 
     private void DrawAOEs(int playerSlot, Actor player, AIHints hints)

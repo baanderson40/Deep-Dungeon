@@ -21,6 +21,7 @@ public sealed class DeepDungeonState
         public readonly bool Active => (Flags & (1 << 1)) != 0;
     }
     public readonly record struct Chest(byte Type, byte Room);
+    public readonly record struct FloorEffects(DungeonType Dungeon, byte Floor, bool Known, byte Layout, byte StatusID, byte BanID, byte DangerID, uint StatusUI, uint BanUI, uint DangerUI, bool GloomKnown, bool Gloom);
 
     public const int NumRooms = 25;
     public const int NumPartyMembers = 4;
@@ -35,6 +36,7 @@ public sealed class DeepDungeonState
     public readonly PomanderState[] Pomanders = new PomanderState[NumPomanderSlots];
     public readonly Chest[] Chests = new Chest[NumChests];
     public readonly byte[] Magicite = new byte[NumMagicites];
+    public FloorEffects FloorEffectsSnapshot;
 
     public bool ReturnActive => Progress.ReturnProgress >= 11;
     public bool PassageActive => Progress.PassageProgress >= 11;
@@ -69,6 +71,8 @@ public sealed class DeepDungeonState
             yield return new OpPomandersChange(Pomanders);
             yield return new OpChestsChange(Chests);
             yield return new OpMagiciteChange(Magicite);
+            if (FloorEffectsSnapshot.Known)
+                yield return new OpFloorEffectsChange(FloorEffectsSnapshot);
         }
     }
 
@@ -77,8 +81,10 @@ public sealed class DeepDungeonState
     {
         protected override void Exec(WorldState ws)
         {
+            var contextChanged = ws.DeepDungeon.DungeonId != DungeonId || ws.DeepDungeon.Progress.Floor != Value.Floor;
             ws.DeepDungeon.DungeonId = DungeonId;
             ws.DeepDungeon.Progress = Value;
+            ws.DeepDungeon.SetFloorEffects(DeepDungeonPolicy.ResetFloorEffectsForContextChange(ws.DeepDungeon.FloorEffectsSnapshot, contextChanged));
             ws.DeepDungeon.ProgressChanged.Fire(this);
         }
         public override void Write(ReplayRecorder.Output output)
@@ -95,6 +101,29 @@ public sealed class DeepDungeonState
                 .Emit(Value.PassageProgress)
                 .Emit(Value.HoardCurrentFloor);
         }
+    }
+
+    public Event<OpFloorEffectsChange> FloorEffectsChanged = new();
+    private void SetFloorEffects(FloorEffects effects)
+    {
+        if (FloorEffectsSnapshot == effects)
+            return;
+        FloorEffectsSnapshot = effects;
+        FloorEffectsChanged.Fire(new(effects));
+    }
+
+    public sealed record class OpFloorEffectsChange(FloorEffects Value) : WorldState.Operation
+    {
+        protected override void Exec(WorldState ws)
+        {
+            if (Value.Known && (Value.Dungeon != ws.DeepDungeon.DungeonId || Value.Floor != ws.DeepDungeon.Floor))
+                return;
+            ws.DeepDungeon.SetFloorEffects(Value);
+        }
+        public override void Write(ReplayRecorder.Output output) => output.EmitFourCC("DDFX"u8)
+            .Emit((byte)Value.Dungeon).Emit(Value.Floor).Emit(Value.Known).Emit(Value.Layout)
+            .Emit(Value.StatusID).Emit(Value.BanID).Emit(Value.DangerID)
+            .Emit(Value.StatusUI).Emit(Value.BanUI).Emit(Value.DangerUI).Emit(Value.GloomKnown).Emit(Value.Gloom);
     }
 
     public Event<OpMapDataChange> MapDataChanged = new();

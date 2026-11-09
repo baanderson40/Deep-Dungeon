@@ -379,6 +379,7 @@ public sealed class ReplayParserLog : IDisposable
             [new("INVT"u8)] = ParseClientInventory,
             [new("FLOS"u8)] = ParseClientFailedLoS,
             [new("DDPG"u8)] = ParseDeepDungeonProgress,
+            [new("DDFX"u8)] = ParseDeepDungeonFloorEffects,
             [new("DDMP"u8)] = ParseDeepDungeonMap,
             [new("DDPT"u8)] = ParseDeepDungeonParty,
             [new("DDIT"u8)] = ParseDeepDungeonPomanders,
@@ -826,6 +827,9 @@ public sealed class ReplayParserLog : IDisposable
     ]);
 
     private DeepDungeonState.OpProgressChange ParseDeepDungeonProgress() => new((DeepDungeonState.DungeonType)_input.ReadByte(false), new(_input.ReadByte(false), _input.ReadByte(false), _input.ReadByte(false), _input.ReadByte(false), _input.ReadByte(false), _input.ReadByte(false), _input.ReadByte(false), _input.ReadByte(false), _version >= 29 && _input.ReadBool()));
+    private DeepDungeonState.OpFloorEffectsChange ParseDeepDungeonFloorEffects() => new(new(
+        (DeepDungeonState.DungeonType)_input.ReadByte(false), _input.ReadByte(false), _input.ReadBool(), _input.ReadByte(false),
+        _input.ReadByte(false), _input.ReadByte(false), _input.ReadByte(false), _input.ReadUInt(false), _input.ReadUInt(false), _input.ReadUInt(false), _input.ReadBool(), _input.ReadBool()));
     private DeepDungeonState.OpMapDataChange ParseDeepDungeonMap()
     {
         var rooms = new FFXIVClientStructs.FFXIV.Client.Game.InstanceContent.InstanceContentDeepDungeon.RoomFlags[DeepDungeonState.NumRooms];
