@@ -53,6 +53,12 @@ public class ThetaStar
 
     public ref Node NodeByIndex(int index) => ref _nodes[index];
     public WPos CellCenter(int index) => _map.GridToWorld(index % _map.Width, index / _map.Width, 0.5f, 0.5f);
+    public WPos NodePosition(int index)
+    {
+        var node = _nodes[index];
+        var (x, y) = _map.IndexToGrid(index);
+        return _map.GridToWorld(x, y, 0.5f + node.EnterOffset.X, 0.5f + node.EnterOffset.Y);
+    }
 
     public (int VisitedGoalCells, int VisitedMaxPriorityCells) CountVisitedGoalCells()
     {

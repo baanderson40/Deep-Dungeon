@@ -81,7 +81,7 @@ public struct NavigationDecision
         ctx.ThetaStar.Start(ctx.Map, playerPosition, 1.0f / playerSpeed);
         var bestNodeIndex = ctx.ThetaStar.Execute();
         ref var bestNode = ref ctx.ThetaStar.NodeByIndex(bestNodeIndex);
-        var waypoints = GetFirstWaypoints(ctx.ThetaStar, ctx.Map, bestNodeIndex, playerPosition);
+        var waypoints = GetFirstWaypoints(ctx.ThetaStar, bestNodeIndex);
         var finishTime = DateTime.Now;
         var searchGoalPosition = ctx.ThetaStar.CellCenter(bestNodeIndex);
         var diagnostic = collectDiagnostics ? BuildPathfindDiagnostic(ctx, hints, playerPosition, requestedHeightY, waypoints.first, searchGoalPosition, comparisonGoal, currentTime, emergencyMode, bestNodeIndex) : null;
@@ -608,7 +608,7 @@ public struct NavigationDecision
 
     private static float ActivationToG(DateTime activation, DateTime current, float rtt) => MathF.Max(0, (float)(activation - current).TotalSeconds - CushionFromRTT(rtt));
 
-    public static (WPos? first, WPos? second) GetFirstWaypoints(ThetaStar pf, Map map, int cell, WPos startingPos)
+    internal static (WPos? first, WPos? second) GetFirstWaypoints(ThetaStar pf, int cell)
     {
         ref var startingNode = ref pf.NodeByIndex(cell);
         if (startingNode.GScore == 0 && startingNode.PathMinG == float.MaxValue)
@@ -620,14 +620,11 @@ public struct NavigationDecision
             ref var node = ref pf.NodeByIndex(cell);
             if (pf.NodeByIndex(node.ParentIndex).GScore == 0)
             {
-                //var dest = pf.CellCenter(cell);
-                // if destination coord matches player coord, do not move along that coordinate, this is used for precise positioning
-                var destCoord = map.IndexToGrid(cell);
-                var playerCoordFrac = map.WorldToGridFrac(startingPos);
-                var playerCoord = map.FracToGrid(playerCoordFrac);
-                var dest = map.GridToWorld(destCoord.x, destCoord.y, destCoord.x == playerCoord.x ? playerCoordFrac.X - playerCoord.x : 0.5f, destCoord.y == playerCoord.y ? playerCoordFrac.Y - playerCoord.y : 0.5f);
-
-                var next = pf.CellCenter(nextCell);
+                // Theta* validated segments to each node's EnterOffset position. Replacing
+                // those endpoints with cell centers can move the issued segment through a
+                // blocked corner, even though the searched segment was clear.
+                var dest = pf.NodePosition(cell);
+                var next = pf.NodePosition(nextCell);
                 return (dest, next);
             }
             nextCell = cell;

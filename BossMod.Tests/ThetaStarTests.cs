@@ -78,6 +78,53 @@ public class ThetaStarTests
     }
 
     [Fact]
+    public void FirstWaypointsPreserveThetaStarOffsetsInsteadOfCuttingBlockedCorner()
+    {
+        var map = new Map(0.5f, default, 5, 5);
+        var start = map.GridToWorld(1, 1, 0.05f, 0.05f);
+        var startIndex = map.GridToIndex(1, 1);
+        var firstIndex = map.GridToIndex(2, 5);
+        var nextIndex = map.GridToIndex(3, 8);
+        var blocked = map.GridToIndex(2, 3);
+        map.PixelMaxG[blocked] = -900;
+
+        var pathfinder = new ThetaStar();
+        pathfinder.Start(map, start, 1);
+        pathfinder.NodeByIndex(firstIndex) = new ThetaStar.Node
+        {
+            GScore = 1,
+            ParentIndex = startIndex,
+            EnterOffset = new(-0.4f, -0.4f),
+        };
+        pathfinder.NodeByIndex(nextIndex) = new ThetaStar.Node
+        {
+            GScore = 2,
+            ParentIndex = firstIndex,
+            EnterOffset = new(-0.4f, -0.4f),
+        };
+
+        var waypoints = NavigationDecision.GetFirstWaypoints(pathfinder, nextIndex);
+        Assert.Equal(pathfinder.NodePosition(firstIndex), waypoints.first);
+        Assert.Equal(pathfinder.NodePosition(nextIndex), waypoints.second);
+
+        var validatedEndpoint = pathfinder.NodePosition(firstIndex);
+        var substitutedCellCenter = pathfinder.CellCenter(firstIndex);
+        Assert.False(SegmentTouchesCell(map, start, validatedEndpoint, 2, 3));
+        Assert.True(SegmentTouchesCell(map, start, substitutedCellCenter, 2, 3));
+    }
+
+    private static bool SegmentTouchesCell(Map map, WPos from, WPos to, int targetX, int targetY)
+    {
+        for (var i = 0; i <= 1000; ++i)
+        {
+            var cell = map.WorldToGrid(WPos.Lerp(from, to, i / 1000f));
+            if (cell.x == targetX && cell.y == targetY)
+                return true;
+        }
+        return false;
+    }
+
+    [Fact]
     public void EqualPriorityStillUsesPathCostAndLargerGAsTieBreak()
     {
         var map = new Map(0.5f, default, 2, 2);
