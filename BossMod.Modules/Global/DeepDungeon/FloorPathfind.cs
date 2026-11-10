@@ -93,6 +93,9 @@ abstract partial class AutoClear : ZoneModule
 
     private (int Index, PathfindReason Reason) DesiredRoom;
     private string? _lastNoPathState;
+    private int _fullClearRevealWaitRoom;
+    private DateTime _fullClearRevealWaitStarted;
+    private bool _fullClearRevealStallLogged;
 
     private void PickARoom(Actor player, AIHints hints)
     {
@@ -205,6 +208,35 @@ abstract partial class AutoClear : ZoneModule
         var destRoom = rects[DesiredRoom.Index];
         if (destRoom.Contains(player.Position))
         {
+            var roomFlags = Palace.Rooms[DesiredRoom.Index];
+            var fullClearPending = !DeepDungeonPolicy.ShouldClearReachedRoomDestination(
+                DesiredRoom.Reason == PathfindReason.Everything,
+                _config.FullClear,
+                roomFlags != RoomFlags.None,
+                roomFlags.HasFlag(RoomFlags.Revealed));
+            if (fullClearPending)
+            {
+                if (_fullClearRevealWaitRoom != DesiredRoom.Index)
+                {
+                    _fullClearRevealWaitRoom = DesiredRoom.Index;
+                    _fullClearRevealWaitStarted = World.CurrentTime;
+                    _fullClearRevealStallLogged = false;
+                    Service.Log($"[AutoDD] full-clear room entered but map reveal is pending: room={DesiredRoom.Index}, floor={Palace.Floor}; holding objective and moving toward room interior.");
+                }
+
+                if (!_fullClearRevealStallLogged && World.CurrentTime - _fullClearRevealWaitStarted >= TimeSpan.FromSeconds(20))
+                {
+                    _fullClearRevealStallLogged = true;
+                    Service.Log($"[AutoDD] full-clear reveal stalled: room={DesiredRoom.Index}, floor={Palace.Floor}, wait={World.CurrentTime - _fullClearRevealWaitStarted}; objective retained to prevent passage/full-clear oscillation.");
+                }
+
+                // Crossing the room bounds does not prove the map reveal has arrived. Keep this
+                // objective and gently move toward the interior while waiting for authoritative map state.
+                var roomCenter = destRoom.Pos;
+                hints.AddGoalZone(p => p.InCircle(roomCenter, 3) ? 0.02f : 0, $"deepdungeon-fullclear-interior:{DesiredRoom.Index}");
+                return;
+            }
+
             LogNoPathState(null, "path available");
             ClearDesiredRoom("destination room reached");
             return;

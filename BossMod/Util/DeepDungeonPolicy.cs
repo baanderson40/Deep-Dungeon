@@ -30,7 +30,7 @@ internal static class DeepDungeonPolicy
             _awaitingMapData = true;
         }
 
-        internal bool CanInitialize(bool validContext, bool hasInitializedMap, bool mapDataUpdate)
+        internal readonly bool CanInitialize(bool validContext, bool hasInitializedMap, bool mapDataUpdate)
             => validContext && hasInitializedMap && !_awaitingContextChange && (!_awaitingMapData || mapDataUpdate);
 
         internal void MarkInitialized()
@@ -252,7 +252,7 @@ internal static class DeepDungeonPolicy
         NoRecentInteraction,
     }
 
-    internal readonly record struct OvercapAttribution(OvercapAttributionStatus Status, ulong ActorID, long InteractionSequence, int CandidateCount, ulong[] CandidateActorIDs, TimeSpan EvidenceAge);
+    internal readonly record struct OvercapAttribution(OvercapAttributionStatus Status, ulong ActorID, long InteractionSequence, int CandidateCount, ImmutableArray<ulong> CandidateActorIDs, TimeSpan EvidenceAge);
 
     internal static OvercapAttribution CorrelateOvercapMessage(
         DateTime messageAt, int dungeonID, byte floor, uint expectedChestOID,
@@ -265,21 +265,21 @@ internal static class DeepDungeonPolicy
         var compatibleCalls = contextCalls.Where(call => call.ObjectID == expectedChestOID).ToArray();
         var actorIDs = compatibleCalls.Select(call => call.ActorID).Distinct().ToArray();
         if (actorIDs.Length > 1)
-            return new(OvercapAttributionStatus.Ambiguous, 0, 0, actorIDs.Length, actorIDs.Take(3).ToArray(), messageAt - compatibleCalls.Max(call => call.IssuedAt));
+            return new(OvercapAttributionStatus.Ambiguous, 0, 0, actorIDs.Length, [.. actorIDs.Take(3)], messageAt - compatibleCalls.Max(call => call.IssuedAt));
         if (actorIDs.Length == 1)
         {
             var latestCall = compatibleCalls.MaxBy(call => call.IssuedAt);
-            return new(OvercapAttributionStatus.Matched, actorIDs[0], latestCall.Sequence, 1, actorIDs, messageAt - latestCall.IssuedAt);
+            return new(OvercapAttributionStatus.Matched, actorIDs[0], latestCall.Sequence, 1, [.. actorIDs], messageAt - latestCall.IssuedAt);
         }
         var otherContextIDs = objectCalls.Where(call => call.DungeonID != dungeonID || call.Floor != floor).Select(call => call.ActorID).Distinct().ToArray();
         if (recentCalls.Any(call => call.ObjectID == expectedChestOID) && contextCalls.All(call => call.ObjectID != expectedChestOID))
-            return new(OvercapAttributionStatus.WrongFloorContext, 0, 0, otherContextIDs.Length, otherContextIDs.Take(3).ToArray(), TimeSpan.Zero);
+            return new(OvercapAttributionStatus.WrongFloorContext, 0, 0, otherContextIDs.Length, [.. otherContextIDs.Take(3)], TimeSpan.Zero);
         if (objectCalls.Length > 0)
-            return new(OvercapAttributionStatus.ExpiredOrFutureInteraction, 0, 0, objectCalls.Select(call => call.ActorID).Distinct().Count(), objectCalls.Select(call => call.ActorID).Distinct().Take(3).ToArray(), TimeSpan.Zero);
+            return new(OvercapAttributionStatus.ExpiredOrFutureInteraction, 0, 0, objectCalls.Select(call => call.ActorID).Distinct().Count(), [.. objectCalls.Select(call => call.ActorID).Distinct().Take(3)], TimeSpan.Zero);
         if (contextCalls.Length > 0)
         {
             var incompatibleIDs = contextCalls.Select(call => call.ActorID).Distinct().ToArray();
-            return new(OvercapAttributionStatus.IncompatibleChest, 0, 0, incompatibleIDs.Length, incompatibleIDs.Take(3).ToArray(), TimeSpan.Zero);
+            return new(OvercapAttributionStatus.IncompatibleChest, 0, 0, incompatibleIDs.Length, [.. incompatibleIDs.Take(3)], TimeSpan.Zero);
         }
         return new(OvercapAttributionStatus.NoRecentInteraction, 0, 0, 0, [], TimeSpan.Zero);
     }
@@ -287,6 +287,20 @@ internal static class DeepDungeonPolicy
     internal static bool ShouldNavigate(bool autoDDEnabled, bool hasManualDestination) => autoDDEnabled || hasManualDestination;
 
     internal static bool IsFloorContextReady(int dungeonID, int floor) => dungeonID != 0 && floor > 0;
+
+    internal static bool IsSupportedDeepDungeonBossEncounter(DeepDungeonState.DungeonType dungeon, byte floor, string? moduleNamespace, BossModuleInfo.GroupType groupType, int sortOrder, bool active)
+    {
+        var expectedNamespace = dungeon switch
+        {
+            DeepDungeonState.DungeonType.POTD => "BossMod.Heavensward.DeepDungeon.PalaceOfTheDead.",
+            DeepDungeonState.DungeonType.HOH => "BossMod.Stormblood.DeepDungeon.HeavenOnHigh.",
+            DeepDungeonState.DungeonType.EO => "BossMod.Endwalker.DeepDungeon.EurekaOrthos.",
+            DeepDungeonState.DungeonType.PT => "BossMod.Dawntrail.DeepDungeon.PilgrimsTraverse.",
+            _ => null,
+        };
+        return active && floor > 0 && groupType == BossModuleInfo.GroupType.CFC && sortOrder == floor
+            && expectedNamespace != null && moduleNamespace?.StartsWith(expectedNamespace, StringComparison.Ordinal) == true;
+    }
 
     internal static bool CanInitializeFloor(int dungeonID, int floor, bool hasInitializedMap)
         => IsFloorContextReady(dungeonID, floor) && hasInitializedMap;
@@ -329,6 +343,9 @@ internal static class DeepDungeonPolicy
     internal static bool ShouldKeepFullClearDestination(bool fullClearEnabled, bool roomActive, bool roomRevealed)
         => fullClearEnabled && roomActive && !roomRevealed;
 
+    internal static bool ShouldClearReachedRoomDestination(bool isFullClearObjective, bool fullClearEnabled, bool roomActive, bool roomRevealed)
+        => !isFullClearObjective || !ShouldKeepFullClearDestination(fullClearEnabled, roomActive, roomRevealed);
+
     internal static bool ShouldConsiderBronzeTreasure(bool targetable, bool opened)
         => targetable && !opened;
 
@@ -337,23 +354,59 @@ internal static class DeepDungeonPolicy
 
     internal static readonly TimeSpan FloorStartPomanderWindow = TimeSpan.FromSeconds(45);
     internal static readonly TimeSpan TreasureRecoveryCooldown = TimeSpan.FromSeconds(60);
-    internal static readonly TimeSpan TreasureRecoveryRepeatWindow = TimeSpan.FromSeconds(10);
-    internal static readonly TimeSpan TreasureRecoveryRefreshWindow = TimeSpan.FromSeconds(2);
+    internal static readonly TimeSpan TreasureStallThreshold = TimeSpan.FromSeconds(30);
+    internal static readonly TimeSpan TreasureOscillationThreshold = TimeSpan.FromSeconds(15);
+    internal static readonly TimeSpan TreasureSelectionContinuity = TimeSpan.FromMilliseconds(250);
+    internal static readonly TimeSpan HoHPomanderProposalTimeout = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan TreasureOscillationSignalMaxAge = TimeSpan.FromSeconds(10);
 
     internal static bool IsFloorStartPomanderEligible(bool configured, bool bossFloor, bool initialized, DateTime initializedAt, DateTime now)
         => configured && !bossFloor && initialized && initializedAt != default && now >= initializedAt && now - initializedAt <= FloorStartPomanderWindow;
 
+    internal static bool WasPomanderAvailableAtFloorEntry(bool entrySnapshotReady, int entryCount)
+        => entrySnapshotReady && entryCount > 0;
+
+    internal static bool ShouldAutoUseWitching(bool enabled, bool bossFloor, int aggroCount, int threshold, bool validSlot, int stock, bool usable, bool solo, bool itemPenalty, bool alreadyHandled)
+        => enabled && !bossFloor && threshold > 0 && aggroCount >= threshold && validSlot && stock > 0 && usable && solo && !itemPenalty && !alreadyHandled;
+
     internal static bool ShouldDeferTreasureForOscillation(bool oscillating, TimeSpan noProgressFor, bool roomObjective, bool manualNavigation,
         bool inCombat, bool casting, bool interactionInRange)
-        => oscillating && noProgressFor >= TimeSpan.FromSeconds(30) && roomObjective && !manualNavigation && !inCombat && !casting && !interactionInRange;
+        => oscillating && noProgressFor >= TreasureOscillationThreshold && roomObjective && !manualNavigation && !inCombat && !casting && !interactionInRange;
 
-    internal static bool IsTreasureRecoveryReady(DateTime firstRecoveryAt, DateTime now)
-        => firstRecoveryAt != default && now >= firstRecoveryAt
-            && now - firstRecoveryAt >= TreasureRecoveryRepeatWindow
-            && now - firstRecoveryAt <= TimeSpan.FromSeconds(30);
+    internal static bool ShouldDeferStalledTreasure(TimeSpan eligibleNoProgressFor, bool isTreasureSelected, bool manualNavigation,
+        bool inCombat, bool casting, bool interactionHeld)
+        => eligibleNoProgressFor >= TreasureStallThreshold && isTreasureSelected && !manualNavigation && !inCombat && !casting && !interactionHeld;
 
-    internal static bool IsTreasureRefreshSuppressed(DateTime refreshAt, DateTime now)
-        => refreshAt != default && now >= refreshAt && now - refreshAt < TreasureRecoveryRefreshWindow;
+    internal static TimeSpan TreasureSelectedSampleDuration(DateTime lastSelectedAt, DateTime now, DateTime lastSampleAt)
+        => lastSelectedAt != default && now >= lastSelectedAt && now - lastSelectedAt <= TreasureSelectionContinuity
+            && lastSampleAt != default && now >= lastSampleAt ? now - lastSampleAt : TimeSpan.Zero;
+
+    internal static bool IsHoHPomanderProposalPending(DateTime proposedAt, DateTime now)
+        => proposedAt != default && now >= proposedAt && now - proposedAt < HoHPomanderProposalTimeout;
+
+    internal static bool IsTreasureOscillationSignalValid(ulong signalActor, ulong selectedActor, byte signalFloor, byte currentFloor, DateTime signalAt, DateTime now)
+        => signalActor != 0 && signalActor == selectedActor && signalFloor == currentFloor && signalAt != default
+            && now >= signalAt && now - signalAt <= TreasureOscillationSignalMaxAge;
+
+    internal static bool ShouldRequestDeepDungeonLeave(bool completionConfirmed, bool sourceTerritoryMatches, bool playerReady, bool transitioning)
+        => completionConfirmed && sourceTerritoryMatches && playerReady && !transitioning;
+
+    internal static uint WaitingRoomExitBaseID(DeepDungeonState.DungeonType dungeon, ushort territory)
+        => (dungeon, territory) switch
+        {
+            (DeepDungeonState.DungeonType.POTD, 570) => 2006016,
+            (DeepDungeonState.DungeonType.HOH, 780) => 2009523,
+            _ => 0,
+        };
+
+    internal static bool IsVerifiedWaitingRoomExit(DeepDungeonState.DungeonType dungeon, ushort territory, uint baseID, bool targetable, int candidateCount)
+        => WaitingRoomExitBaseID(dungeon, territory) == baseID && baseID != 0 && targetable && candidateCount == 1;
+
+    internal static bool ShouldStartDeparturePath(bool navReady, bool pathRunning, bool pathfindInProgress, bool validExit, bool validPlayer)
+        => navReady && !pathRunning && !pathfindInProgress && validExit && validPlayer;
+
+    internal static bool OwnsDeparturePath(bool pathRunning, int waypointCount, float endpointDistance, float tolerance)
+        => pathRunning && waypointCount > 0 && endpointDistance <= tolerance;
 
     internal static bool IsTreasureDeferred(DateTime deferredAt, DateTime now)
         => deferredAt != default && now >= deferredAt && now - deferredAt < TreasureRecoveryCooldown;
@@ -423,8 +476,8 @@ internal static class DeepDungeonPolicy
         : "no meaningful distance progress";
 
     internal static string ObjectiveNavigationOwner(bool hasRoomObjective, string? actorGoalType, bool actorGoalActive)
-        => hasRoomObjective && (actorGoalType is "Treasure" or "Hoard") && actorGoalActive ? $"room objective with {actorGoalType.ToLowerInvariant()} detour"
-        : hasRoomObjective && (actorGoalType is "Treasure" or "Hoard") ? $"room objective; {actorGoalType.ToLowerInvariant()} candidate pending"
+        => hasRoomObjective && (actorGoalType is "Treasure" or "Hoard") && actorGoalActive ? $"room objective with {(actorGoalType == "Treasure" ? "treasure" : "hoard")} detour"
+        : hasRoomObjective && (actorGoalType is "Treasure" or "Hoard") ? $"room objective; {(actorGoalType == "Treasure" ? "treasure" : "hoard")} candidate pending"
         : hasRoomObjective ? "room objective"
         : actorGoalType is null ? "none"
         : actorGoalActive ? $"actor objective ({actorGoalType})"
@@ -552,6 +605,16 @@ internal static class DeepDungeonPolicy
 
         return reason == "eligible";
     }
+
+    internal static PomanderID SelectHoHFloorClearPomander(bool petrificationEnabled, bool petrificationAvailable, bool petrificationUsedThisFloor,
+        bool frailtyEnabled, bool frailtyAvailable, bool frailtyUsedThisFloor)
+        => petrificationUsedThisFloor ? PomanderID.None
+        : petrificationEnabled && petrificationAvailable ? PomanderID.Petrification
+        : frailtyEnabled && frailtyAvailable && !frailtyUsedThisFloor ? PomanderID.Frailty
+        : PomanderID.None;
+
+    internal static bool ShouldUseHoHPomanders(DeepDungeonState.DungeonType dungeon, bool normalFloor, bool passageActive)
+        => dungeon == DeepDungeonState.DungeonType.HOH && normalFloor && !passageActive;
 
     internal static PomanderDispatchStatus GetPomanderDispatchStatus(bool animationLocked, bool validDungeonAndAction, bool directorAvailable, bool validSlot)
         => animationLocked ? PomanderDispatchStatus.AnimationLocked

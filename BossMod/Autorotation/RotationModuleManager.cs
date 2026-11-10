@@ -17,6 +17,7 @@ public sealed class RotationModuleManager : IDisposable
     public readonly record struct LineOfSightFix(ulong TargetID, WPos Origin, WPos Destination);
 
     public readonly List<Preset> Presets = [];
+    public long PresetSelectionVersion { get; private set; }
 
     public readonly AutorotationConfig Config = Service.Config.Get<AutorotationConfig>();
     public readonly RotationDatabase Database;
@@ -207,17 +208,23 @@ public sealed class RotationModuleManager : IDisposable
             Presets.Add(p);
             dirty = true;
         }
+        if (dirty)
+            ++PresetSelectionVersion;
         DirtyActiveModules(dirty);
     }
 
     public void Deactivate(Preset p)
     {
         if (Presets.Remove(p))
+        {
+            ++PresetSelectionVersion;
             DirtyActiveModules(true);
+        }
     }
 
     public void Toggle(Preset p, bool exclusive = false)
     {
+        var previous = Presets.ToArray();
         if (!Presets.Remove(p))
         {
             if (exclusive)
@@ -226,19 +233,28 @@ public sealed class RotationModuleManager : IDisposable
         }
         if (p != ForceDisable)
             Presets.Remove(ForceDisable);
+        var changed = !previous.SequenceEqual(Presets);
+        if (changed)
+            ++PresetSelectionVersion;
         DirtyActiveModules(true);
     }
 
     public void Clear()
     {
+        var changed = Presets.Count > 0;
         Presets.Clear();
+        if (changed)
+            ++PresetSelectionVersion;
         DirtyActiveModules(true);
     }
 
     public void SetForceDisabled()
     {
+        var changed = Presets.Count != 1 || Presets[0] != ForceDisable;
         Presets.Clear();
         Presets.Add(ForceDisable);
+        if (changed)
+            ++PresetSelectionVersion;
         DirtyActiveModules(true);
     }
 

@@ -9,6 +9,10 @@ public sealed class AutorotationConfig : ConfigNode
     [PropertyDisplay("Hide built-in presets", tooltip: "If you've created your own presets and no longer need the included defaults, this option will prevent them from being shown in the Autorotation and Preset Editor windows.", since: "0.0.0.253")]
     public bool HideDefaultPreset = false;
 
+    // Legacy storage for migration into AutoDDConfig; JsonIgnore prevents it being written again.
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool AutoActivateDungeonAI;
+
     public bool SuggestHealerAI = true;
 
     [PropertyDisplay("Show positional hints in world", tooltip: "Show tips for positional abilities, indicating to move to the flank or rear of your target")]

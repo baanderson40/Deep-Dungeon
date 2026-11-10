@@ -12,7 +12,7 @@ internal enum HistoricalTrapInputState
 
 internal readonly record struct HistoricalTrapInput(
     HistoricalTrapInputState State,
-    Vector3[] Locations,
+    ImmutableArray<Vector3> Locations,
     int Returned,
     int Invalid,
     int Problematic)
@@ -80,7 +80,7 @@ internal static class PalantirTrapData
     }
 
     internal static List<Vector3> FilterForFloor(IEnumerable<Vector3> locations, Func<Vector3, bool> belongsToFloor)
-        => locations.Where(belongsToFloor).ToList();
+        => [.. locations.Where(belongsToFloor)];
 
     internal static FloorTrapInput FilterFloor(IEnumerable<Vector3> locations, Func<Vector3, bool> belongsToFloor)
     {

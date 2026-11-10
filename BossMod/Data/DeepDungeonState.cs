@@ -4,6 +4,10 @@ namespace BossMod;
 
 public sealed class DeepDungeonState
 {
+    // Runtime completion latch set only after a supported boss was observed alive and then dead.
+    // Intentionally retained while Deep Dungeon state clears during the leave transition.
+    public bool BossCompletionObserved { get; internal set; }
+
     public enum DungeonType : byte
     {
         None = 0,

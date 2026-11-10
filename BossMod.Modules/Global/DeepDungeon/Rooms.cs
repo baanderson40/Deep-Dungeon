@@ -155,8 +155,7 @@ abstract partial class AutoClear : ZoneModule
         return true;
     }
 
-    private static bool ValidRoomBox(RoomBox box) =>
-        box.Scale.X > 0 && box.Scale.Z > 0
+    private static bool ValidRoomBox(RoomBox box) => box.Scale.X > 0 && box.Scale.Z > 0
         && float.IsFinite(box.Position.X) && float.IsFinite(box.Position.Z)
         && float.IsFinite(box.Scale.X) && float.IsFinite(box.Scale.Z);
 

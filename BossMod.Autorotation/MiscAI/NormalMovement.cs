@@ -95,6 +95,7 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
     private long _nextDecisionSequence;
     private DateTime _lastDDRouteSampleAt;
     private int _ddRouteFloor = -1;
+    private ulong _ddRouteTreasureGoalID;
     private readonly Queue<RouteSample> _ddRouteSamples = new();
 
     private readonly record struct RouteSample(DateTime At, WPos Position, float HeightY, long Decision, WPos? Destination, WPos? SearchGoal, ulong Interaction, Vector3? RequestedDirection, WDir RouteDirection);
@@ -212,6 +213,7 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
             _ddRouteFloor = World.DeepDungeon.Floor;
             _ddRouteSamples.Clear();
             _lastDDRouteSampleAt = default;
+            _ddRouteTreasureGoalID = Hints.DeepDungeonTreasureGoalID;
             _hasDDStationaryAnchor = false;
             _lastDDNavigationDiagnostic = default;
             _lastDDPathDiagnosticLoggedAt = default;
@@ -231,6 +233,7 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
             _ddPathDiagnosticRequested = false;
             _ddObjectiveDiagnosticRequested = false;
             _ddRouteSamples.Clear();
+            _ddRouteTreasureGoalID = 0;
             return;
         }
 
@@ -245,6 +248,7 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
             _ddPathDiagnosticRequested = false;
             _ddObjectiveDiagnosticRequested = false;
             _ddRouteSamples.Clear();
+            _ddRouteTreasureGoalID = 0;
             return;
         }
 
@@ -274,6 +278,14 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
             resetStationaryAnchor = true;
         }
 
+        var stationaryFor = now - _ddStationarySince;
+        if (_ddRouteTreasureGoalID != Hints.DeepDungeonTreasureGoalID)
+        {
+            // Never combine route reversals from one chest with a newly selected chest.
+            _ddRouteTreasureGoalID = Hints.DeepDungeonTreasureGoalID;
+            _ddRouteSamples.Clear();
+            _lastDDRouteSampleAt = default;
+        }
         if (!resetStationaryAnchor && (_lastDDRouteSampleAt == default || now - _lastDDRouteSampleAt >= TimeSpan.FromMilliseconds(250)))
         {
             var routeDirection = decision.Destination is { } target ? target - Player.Position : default;
@@ -282,7 +294,15 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
             _lastDDRouteSampleAt = now;
         }
 
-        var stationaryFor = now - _ddStationarySince;
+        // Recovery signaling is independent of diagnostic log throttling/path traces.
+        // Keep the stationary and route-reversal thresholds used by the diagnostic classifier.
+        if (stationaryFor >= TimeSpan.FromSeconds(10) && Hints.DeepDungeonTreasureGoalID != 0 && HasRepeatedRouteReversals())
+        {
+            Hints.DeepDungeonOscillatingTreasureID = Hints.DeepDungeonTreasureGoalID;
+            Hints.DeepDungeonOscillationFloor = World.DeepDungeon.Floor;
+            Hints.DeepDungeonOscillationAt = now;
+        }
+
         var pathTraceMatchesStationary = decision.PathfindDiagnosticAt >= _ddStationarySince;
         var pathTraceMatchesObjectiveRequest = _ddObjectiveDiagnosticRequestedAt != default && decision.PathfindDiagnosticAt >= _ddObjectiveDiagnosticRequestedAt;
         var hasNewPathTrace = decision.PathfindDiagnostic != null
@@ -311,12 +331,6 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
         var diagnosticKind = DeepDungeonPolicy.ClassifyMovementDiagnostic(
             HasRepeatedRouteReversals(), World.DeepDungeon.IsBossFloor, interactionSuppressed, castingSuppressed,
             Player.InCombat, decision.Destination != null, movementIssued, goalHere, goalDestination);
-        if (diagnosticKind == DeepDungeonPolicy.MovementDiagnosticKind.NavigationOscillation && Hints.DeepDungeonTreasureGoalID != 0)
-        {
-            Hints.DeepDungeonOscillatingTreasureID = Hints.DeepDungeonTreasureGoalID;
-            Hints.DeepDungeonOscillationFloor = World.DeepDungeon.Floor;
-            Hints.DeepDungeonOscillationAt = now;
-        }
         var decisionAge = _lastDecisionUpdatedAt == default ? "unknown" : $"{(now - _lastDecisionUpdatedAt).TotalSeconds:F1}s";
         var requestAge = decision.RequestedAt == default ? "unknown" : $"{(now - decision.RequestedAt).TotalSeconds:F2}s";
         static string FormatPosition(WPos? position) => position is { } p ? $"(x:{p.X:F1},z:{p.Z:F1})" : "none";

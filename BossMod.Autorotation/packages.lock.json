@@ -54,11 +54,8 @@
       },
       "KamiToolKit": {
         "type": "Transitive",
-        "resolved": "1.1.2",
-        "contentHash": "pyydp+XFd+E00uEXXd44GGNCCH2uAK1ndwjLVHKVrHg059g65ry+92a5UdDISWZRJMhK+LcDpDUPSijnFavCvQ==",
-        "dependencies": {
-          "SixLabors.ImageSharp": "3.1.12"
-        }
+        "resolved": "1.1.18",
+        "contentHash": "Qz/1HFEUHrVhYBw08g7Nf6us2kcKO2tbTDY3KNG/NDOwvH+LEzCYmEhN597osvcl8UKhOzOTZ0eipuoWnQzG4g=="
       },
       "Microsoft.Extensions.Caching.Abstractions": {
         "type": "Transitive",
@@ -444,16 +441,6 @@
           "SharpDX": "4.2.0"
         }
       },
-      "SixLabors.ImageSharp": {
-        "type": "Transitive",
-        "resolved": "3.1.12",
-        "contentHash": "iAg6zifihXEFS/t7fiHhZBGAdCp3FavsF4i2ZIDp0JfeYeDVzvmlbY1CNhhIKimaIzrzSi5M/NBFcWvZT2rB/A=="
-      },
-      "System.Data.SQLite": {
-        "type": "Transitive",
-        "resolved": "2.0.4",
-        "contentHash": "iiawN8l6QBzLZTK2BQRyq/1XmvDONghjvXoDhkkQgPTG8bRIsmIxJV1+Lc75fviNgMnjAE3wxReVJAF7P1hkoQ=="
-      },
       "System.Diagnostics.EventLog": {
         "type": "Transitive",
         "resolved": "10.0.4",
@@ -471,9 +458,9 @@
           "DalaMock.Host": "[6.2.1, )",
           "DalaMock.Shared": "[6.2.1, )",
           "DalamudPackager": "[15.0.0, )",
+          "KamiToolKit": "[1.1.18, )",
           "Microsoft.Extensions.Caching.Memory": "[10.0.12, )",
           "Pictomancy": "[1.0.10, )",
-          "System.Data.Sqlite": "[2.0.4, )",
           "System.Numerics.Tensors": "[10.0.14, )"
         }
       }

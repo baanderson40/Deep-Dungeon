@@ -10,6 +10,111 @@ public class DeepDungeonPolicyTests
     private static bool[] FullRoomSet() => Enumerable.Repeat(true, 25).ToArray();
 
     [Theory]
+    [InlineData(1, 100, "BossMod.Heavensward.DeepDungeon.PalaceOfTheDead.D100NybethObdilord")]
+    [InlineData(2, 90, "BossMod.Stormblood.DeepDungeon.HeavenOnHigh.D90Onra")]
+    [InlineData(3, 90, "BossMod.Endwalker.DeepDungeon.EurekaOrthos.D90Administrator")]
+    [InlineData(4, 99, "BossMod.Dawntrail.DeepDungeon.PilgrimsTraverse.D99TheFinalVerse.D99TheFinalVerse")]
+    public void SupportedBossEncounterMustMatchDungeonAndFloor(int dungeon, byte floor, string moduleNamespace)
+        => Assert.True(DeepDungeonPolicy.IsSupportedDeepDungeonBossEncounter((DeepDungeonState.DungeonType)dungeon, floor, moduleNamespace,
+            BossModuleInfo.GroupType.CFC, floor, active: true));
+
+    [Fact]
+    public void UnsupportedBossEncountersFailClosed()
+    {
+        Assert.False(DeepDungeonPolicy.IsSupportedDeepDungeonBossEncounter(DeepDungeonState.DungeonType.POTD, 100,
+            "BossMod.Heavensward.DeepDungeon.PalaceOfTheDead.D100NybethObdilord", BossModuleInfo.GroupType.CFC, 90, active: true));
+        Assert.False(DeepDungeonPolicy.IsSupportedDeepDungeonBossEncounter(DeepDungeonState.DungeonType.POTD, 100,
+            "BossMod.Heavensward.DeepDungeon.PalaceOfTheDead.D100NybethObdilord", BossModuleInfo.GroupType.CFC, 100, active: false));
+        Assert.False(DeepDungeonPolicy.IsSupportedDeepDungeonBossEncounter(DeepDungeonState.DungeonType.POTD, 100,
+            "BossMod.Heavensward.DeepDungeon.PalaceOfTheDead.D100NybethObdilord", BossModuleInfo.GroupType.None, 100, active: true));
+    }
+
+    [Theory]
+    [InlineData(true, true, true, false, true)]
+    [InlineData(true, false, true, false, false)]
+    [InlineData(true, true, false, false, false)]
+    [InlineData(true, true, true, true, false)]
+    [InlineData(false, true, true, false, false)]
+    public void BossDepartureRequestRequiresCompletionSourceAndReadyPlayer(bool defeated, bool sourceTerritory, bool ready, bool transitioning, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.ShouldRequestDeepDungeonLeave(defeated, sourceTerritory, ready, transitioning));
+
+    [Theory]
+    [InlineData(1, 570, 2006016, true, 1, true)]
+    [InlineData(2, 780, 2009523, true, 1, true)]
+    [InlineData(1, 780, 2006016, true, 1, false)]
+    [InlineData(2, 570, 2009523, true, 1, false)]
+    [InlineData(2, 780, 2009523, false, 1, false)]
+    [InlineData(2, 780, 2009523, true, 2, false)]
+    [InlineData(2, 780, 2006016, true, 1, false)]
+    public void WaitingRoomExitRequiresMatchingDungeonTerritoryUniqueTargetableExit(int dungeon, ushort territory, uint baseID, bool targetable, int candidates, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.IsVerifiedWaitingRoomExit((DeepDungeonState.DungeonType)dungeon, territory, baseID, targetable, candidates));
+
+    [Theory]
+    [InlineData(true, false, false, true, true, true)]
+    [InlineData(false, false, false, true, true, false)]
+    [InlineData(true, true, false, true, true, false)]
+    [InlineData(true, false, true, true, true, false)]
+    [InlineData(true, false, false, false, true, false)]
+    [InlineData(true, false, false, true, false, false)]
+    public void DepartureVnavStartsOnlyWhenReadyAndUnowned(bool ready, bool pathRunning, bool pathfinding, bool validExit, bool validPlayer, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.ShouldStartDeparturePath(ready, pathRunning, pathfinding, validExit, validPlayer));
+
+    [Theory]
+    [InlineData(true, 2, 0.5f, 1.5f, true)]
+    [InlineData(false, 2, 0.5f, 1.5f, false)]
+    [InlineData(true, 0, 0, 1.5f, false)]
+    [InlineData(true, 2, 2, 1.5f, false)]
+    public void DeparturePathOwnershipRequiresLiveMatchingEndpoint(bool running, int waypointCount, float distance, float tolerance, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.OwnsDeparturePath(running, waypointCount, distance, tolerance));
+
+    [Theory]
+    [InlineData(true, true, false, true, true, false, PomanderID.Petrification)]
+    [InlineData(true, false, false, true, true, false, PomanderID.Frailty)]
+    [InlineData(false, false, false, true, true, false, PomanderID.Frailty)]
+    [InlineData(true, true, true, true, true, false, PomanderID.None)]
+    [InlineData(false, false, false, true, true, true, PomanderID.None)]
+    public void HoHFloorPomanderPrefersPetrificationAndDoesNotStackFrailty(bool petriEnabled, bool petriAvailable, bool petriUsed,
+        bool frailtyEnabled, bool frailtyAvailable, bool frailtyUsed, PomanderID expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.SelectHoHFloorClearPomander(petriEnabled, petriAvailable, petriUsed,
+            frailtyEnabled, frailtyAvailable, frailtyUsed));
+
+    [Fact]
+    public void HoHPomanderProposalDoesNotCountAsUseAndFrailtyRemainsFallback()
+    {
+        var now = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        Assert.True(DeepDungeonPolicy.IsHoHPomanderProposalPending(now, now.AddSeconds(4)));
+        Assert.False(DeepDungeonPolicy.IsHoHPomanderProposalPending(now, now.AddSeconds(5)));
+        Assert.Equal(PomanderID.Frailty, DeepDungeonPolicy.SelectHoHFloorClearPomander(
+            petrificationEnabled: true, petrificationAvailable: false, petrificationUsedThisFloor: false,
+            frailtyEnabled: true, frailtyAvailable: true, frailtyUsedThisFloor: false));
+    }
+
+    [Theory]
+    [InlineData(2, true, false, true)]
+    [InlineData(2, true, true, false)]
+    [InlineData(2, false, false, false)]
+    [InlineData(1, true, false, false)]
+    public void HoHPomanderPoliciesStopAtPassageRegardlessOfFullClear(int dungeon, bool normalFloor, bool passageActive, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.ShouldUseHoHPomanders((DeepDungeonState.DungeonType)dungeon, normalFloor, passageActive));
+
+    [Fact]
+    public void HoHPolicyTogglesAreIndependentFromOvercapSelections()
+    {
+        var config = new AutoDDConfig();
+        Assert.False(config.AutoFrailty);
+        Assert.False(config.AutoPetrification);
+
+        config.AutoPoms.Toggle((int)PomanderID.Frailty);
+        Assert.False(config.AutoFrailty);
+        Assert.False(config.AutoPetrification);
+
+        config.AutoPetrification = true;
+        Assert.True(config.AutoPetrification);
+        Assert.True(config.AutoPoms[(int)PomanderID.Frailty]);
+        Assert.False(config.AutoPoms[(int)PomanderID.Petrification]);
+    }
+
+    [Theory]
     [InlineData(false, false, false)]
     [InlineData(false, true, true)]
     [InlineData(true, false, true)]
@@ -570,6 +675,25 @@ public class DeepDungeonPolicyTests
         Assert.Equal(new ulong[] { 123, 456 }, ambiguous.CandidateActorIDs);
     }
 
+    [Fact]
+    public void AmbiguousOvercapAttributionCapsDiagnosticCandidateIDs()
+    {
+        var messageAt = new DateTime(2026, 1, 1, 0, 0, 5, DateTimeKind.Utc);
+        DeepDungeonInteractionHistory.TreasureCall[] calls =
+        [
+            new(123, 0x1EA13E, 1, 31, messageAt.AddSeconds(-4), 1),
+            new(456, 0x1EA13E, 1, 31, messageAt.AddSeconds(-3), 2),
+            new(789, 0x1EA13E, 1, 31, messageAt.AddSeconds(-2), 3),
+            new(321, 0x1EA13E, 1, 31, messageAt.AddSeconds(-1), 4),
+        ];
+
+        var result = DeepDungeonPolicy.CorrelateOvercapMessage(messageAt, 1, 31, 0x1EA13E, calls);
+
+        Assert.Equal(DeepDungeonPolicy.OvercapAttributionStatus.Ambiguous, result.Status);
+        Assert.Equal(4, result.CandidateCount);
+        Assert.Equal(new ulong[] { 123, 456, 789 }, result.CandidateActorIDs);
+    }
+
     [Theory]
     [InlineData(1, 30, 0x1EA13E, "WrongFloorContext")]
     [InlineData(1, 31, 0x1EA13D, "IncompatibleChest")]
@@ -639,25 +763,28 @@ public class DeepDungeonPolicyTests
     }
 
     [Fact]
-    public void ReachedRoomDoesNotChurnDestinationWhileMapRevealIsDelayed()
+    public void FullClearArrivalKeepsObjectiveUntilMapRevealInsteadOfReturningToPassage()
     {
+        var objectiveIsFullClear = true;
         for (var frame = 0; frame < 20; ++frame)
         {
-            var selectedRoom = 0;
-            if (DeepDungeonPolicy.ShouldSelectRoomDestination(true, true, false))
-                selectedRoom = 7; // full-clear candidate still ahead
-            if (DeepDungeonPolicy.ShouldSelectRoomDestination(true, true, true))
-                selectedRoom = 12; // passage candidate is already occupied
-
-            Assert.Equal(7, selectedRoom);
+            if (DeepDungeonPolicy.ShouldClearReachedRoomDestination(objectiveIsFullClear, true, true, roomRevealed: false))
+                objectiveIsFullClear = false;
+            Assert.True(objectiveIsFullClear); // retained objective blocks passage/full-clear reselection
         }
 
-        // Once the player reaches the remaining candidate, neither stale nor updated map state
-        // should create another room-navigation objective from the room they already occupy.
-        Assert.False(DeepDungeonPolicy.ShouldSelectRoomDestination(true, true, true));
-        Assert.False(DeepDungeonPolicy.ShouldSelectRoomDestination(true, false, true));
-        Assert.False(DeepDungeonPolicy.ShouldSelectRoomDestination(true, false, false)); // delayed reveal has now arrived
+        Assert.True(DeepDungeonPolicy.ShouldClearReachedRoomDestination(objectiveIsFullClear, true, true, roomRevealed: true));
+        Assert.False(DeepDungeonPolicy.ShouldClearReachedRoomDestination(objectiveIsFullClear, true, true, roomRevealed: false));
     }
+
+    [Theory]
+    [InlineData(false, true, true, false, true)]
+    [InlineData(true, true, true, false, false)]
+    [InlineData(true, true, true, true, true)]
+    [InlineData(true, true, false, false, true)]
+    [InlineData(true, false, true, false, true)]
+    public void ReachedRoomClearsOnlyWhenFullClearNoLongerPending(bool fullClearObjective, bool enabled, bool roomActive, bool revealed, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.ShouldClearReachedRoomDestination(fullClearObjective, enabled, roomActive, revealed));
 
     [Theory]
     [InlineData(true, true, false, true)]
@@ -693,6 +820,27 @@ public class DeepDungeonPolicyTests
         Assert.False(DeepDungeonPolicy.IsFloorStartPomanderEligible(false, false, true, initializedAt, initializedAt));
     }
 
+    [Theory]
+    [InlineData(false, 1, false)]
+    [InlineData(true, 0, false)]
+    [InlineData(true, 1, true)]
+    [InlineData(true, 3, true)]
+    public void FloorStartPomanderRequiresStockAtEntry(bool snapshotReady, int entryCount, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.WasPomanderAvailableAtFloorEntry(snapshotReady, entryCount));
+
+    [Theory]
+    [InlineData(true, false, 3, 4, true, 1, true, true, false, false, false)]
+    [InlineData(true, false, 4, 4, true, 1, true, true, false, false, true)]
+    [InlineData(true, false, 5, 4, true, 1, true, true, false, true, false)]
+    [InlineData(true, true, 5, 4, true, 1, true, true, false, false, false)]
+    [InlineData(false, false, 5, 4, true, 1, true, true, false, false, false)]
+    [InlineData(true, false, 5, 4, false, 0, false, true, false, false, false)]
+    [InlineData(true, false, 5, 4, true, 1, true, false, false, false, false)]
+    [InlineData(true, false, 5, 4, true, 1, true, true, true, false, false)]
+    public void AutoWitchingRequiresConfiguredThresholdAndAllSafetyGates(bool enabled, bool bossFloor, int aggroCount, int threshold,
+        bool validSlot, int stock, bool usable, bool solo, bool itemPenalty, bool alreadyHandled, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.ShouldAutoUseWitching(enabled, bossFloor, aggroCount, threshold, validSlot, stock, usable, solo, itemPenalty, alreadyHandled));
+
     [Fact]
     public void TreasureProgressGoalRewardsCloserPositionsAndNotDistantInteractionAttraction()
     {
@@ -706,11 +854,11 @@ public class DeepDungeonPolicyTests
     }
 
     [Fact]
-    public void TreasureRecoveryRequiresRepeatedOscillationAndRespectsOwnershipAndInteraction()
+    public void TreasureOscillationDeferralRequiresSustainedOwnedNavigationAndRespectsSafetyGates()
     {
-        Assert.True(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(30), true, false, false, false, false));
+        Assert.True(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(15), true, false, false, false, false));
         Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(false, TimeSpan.FromSeconds(60), true, false, false, false, false));
-        Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(29.9), true, false, false, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(14.9), true, false, false, false, false));
         Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(60), false, false, false, false, false));
         Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(60), true, true, false, false, false));
         Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(60), true, false, true, false, false));
@@ -718,11 +866,38 @@ public class DeepDungeonPolicyTests
         Assert.False(DeepDungeonPolicy.ShouldDeferTreasureForOscillation(true, TimeSpan.FromSeconds(60), true, false, false, false, true));
 
         var now = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-        Assert.False(DeepDungeonPolicy.IsTreasureRecoveryReady(now, now.AddSeconds(9.99)));
-        Assert.True(DeepDungeonPolicy.IsTreasureRecoveryReady(now, now.AddSeconds(10)));
-        Assert.False(DeepDungeonPolicy.IsTreasureRecoveryReady(now, now.AddSeconds(30).AddTicks(1)));
+        Assert.True(DeepDungeonPolicy.IsTreasureOscillationSignalValid(123, 123, 8, 8, now, now.AddSeconds(10)));
+        Assert.False(DeepDungeonPolicy.IsTreasureOscillationSignalValid(123, 124, 8, 8, now, now.AddSeconds(1)));
+        Assert.False(DeepDungeonPolicy.IsTreasureOscillationSignalValid(123, 123, 7, 8, now, now.AddSeconds(1)));
+        Assert.False(DeepDungeonPolicy.IsTreasureOscillationSignalValid(123, 123, 8, 8, now, now.AddSeconds(10).AddTicks(1)));
+        Assert.False(DeepDungeonPolicy.IsTreasureOscillationSignalValid(123, 123, 8, 8, now, now.AddTicks(-1)));
+        Assert.False(DeepDungeonPolicy.IsTreasureOscillationSignalValid(0, 0, 8, 8, now, now.AddSeconds(1)));
         Assert.True(DeepDungeonPolicy.IsTreasureDeferred(now, now.AddSeconds(59.99)));
         Assert.False(DeepDungeonPolicy.IsTreasureDeferred(now, now.AddSeconds(60)));
+    }
+
+    [Fact]
+    public void TreasureStallDeferralUsesIndependentEligibleTimeAndHonorsControlHolds()
+    {
+        Assert.True(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromSeconds(30), true, false, false, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromSeconds(29.9), true, false, false, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromMinutes(2), false, false, false, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromMinutes(2), true, true, false, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromMinutes(2), true, false, true, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromMinutes(2), true, false, false, true, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromMinutes(2), true, false, false, false, true));
+    }
+
+    [Fact]
+    public void TreasureStallDoesNotChargeTimeAcrossSelectionChurnGaps()
+    {
+        var selectedAt = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        Assert.Equal(TimeSpan.FromMilliseconds(100), DeepDungeonPolicy.TreasureSelectedSampleDuration(
+            selectedAt, selectedAt.AddMilliseconds(100), selectedAt));
+        Assert.Equal(TimeSpan.Zero, DeepDungeonPolicy.TreasureSelectedSampleDuration(
+            selectedAt, selectedAt.AddSeconds(5), selectedAt));
+        Assert.Equal(TimeSpan.Zero, DeepDungeonPolicy.TreasureSelectedSampleDuration(
+            selectedAt, selectedAt.AddMilliseconds(-1), selectedAt));
     }
 
     [Theory]
