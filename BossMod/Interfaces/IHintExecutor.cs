@@ -60,8 +60,10 @@ internal sealed class HintExecutor(WorldState ws, MovementOverride movementOverr
 
         var player = ws.Party.Player();
         var interactionTarget = hints.InteractWithTarget;
-        var inInteractionRange = CheckInteractRange(player, interactionTarget);
-        movementOverride.RecordInteractionMovementSuppression(inInteractionRange, interactionTarget?.InstanceID ?? 0);
+        var rawInteractionTarget = interactionTarget == null ? hints.InteractWithRawTarget : null;
+        var inInteractionRange = interactionTarget != null ? CheckInteractRange(player, interactionTarget) : CheckInteractRange(player, rawInteractionTarget);
+        var interactionTargetID = interactionTarget?.InstanceID ?? (rawInteractionTarget != null ? GetRawObjectIdentity(rawInteractionTarget) : 0);
+        movementOverride.RecordInteractionMovementSuppression(inInteractionRange, interactionTargetID);
         UpdateTreasureInteractionDiagnostics(player, interactionTarget, inInteractionRange);
         if (ws.DeepDungeon.DungeonId != DeepDungeonState.DungeonType.None)
         {
@@ -69,8 +71,8 @@ internal sealed class HintExecutor(WorldState ws, MovementOverride movementOverr
             {
                 _lastDDInteractionMovementSuppressed = inInteractionRange;
                 Service.Log(inInteractionRange
-                    ? $"[AutoDD] movement suppression active for interaction target={interactionTarget?.InstanceID.ToString() ?? "none"}, animationLock={amex.EffectiveAnimationLock}."
-                    : $"[AutoDD] movement suppression cleared; interaction target={interactionTarget?.InstanceID.ToString() ?? "none"}.");
+                    ? $"[AutoDD] movement suppression active for interaction target={interactionTargetID}, animationLock={amex.EffectiveAnimationLock}."
+                    : $"[AutoDD] movement suppression cleared; interaction target={interactionTargetID}.");
             }
         }
         else
@@ -82,7 +84,9 @@ internal sealed class HintExecutor(WorldState ws, MovementOverride movementOverr
 
             if (amex.EffectiveAnimationLock == 0 && ws.CurrentTime >= _throttleInteract)
             {
-                FFXIVClientStructs.FFXIV.Client.Game.Control.TargetSystem.Instance()->InteractWithObject(GetActorObject(interactionTarget), false);
+                var objectToInteract = interactionTarget != null ? GetActorObject(interactionTarget) : GetRawObject(rawInteractionTarget);
+                if (objectToInteract != null)
+                    FFXIVClientStructs.FFXIV.Client.Game.Control.TargetSystem.Instance()->InteractWithObject(objectToInteract, false);
                 RecordTreasureInteractionRequest(interactionTarget);
                 _throttleInteract = ws.FutureTime(0.1f);
             }
@@ -205,6 +209,15 @@ internal sealed class HintExecutor(WorldState ws, MovementOverride movementOverr
         return EventFramework.Instance()->CheckInteractRange(playerObj, targetObj, 1, false);
     }
 
+    private unsafe bool CheckInteractRange(Actor? player, Dalamud.Game.ClientState.Objects.Types.IGameObject? target)
+    {
+        if (target is not { IsTargetable: true })
+            return false;
+        var playerObj = GetActorObject(player);
+        var targetObj = GetRawObject(target);
+        return playerObj != null && targetObj != null && EventFramework.Instance()->CheckInteractRange(playerObj, targetObj, 1, false);
+    }
+
     private unsafe void HandleFateSync()
     {
         var fm = FateManager.Instance();
@@ -240,4 +253,14 @@ internal sealed class HintExecutor(WorldState ws, MovementOverride movementOverr
 
         return obj;
     }
+
+    private unsafe FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject* GetRawObject(Dalamud.Game.ClientState.Objects.Types.IGameObject? obj)
+    {
+        if (obj == null || !obj.IsTargetable || obj.Address == IntPtr.Zero || !Service.ObjectTable.Any(current => current.Address == obj.Address))
+            return null;
+        return (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)obj.Address;
+    }
+
+    private static ulong GetRawObjectIdentity(Dalamud.Game.ClientState.Objects.Types.IGameObject obj)
+        => obj.EntityId != 0xE0000000 && (obj.EntityId & 0xFF000000) != 0xFF000000 ? obj.EntityId : unchecked((ulong)obj.Address.ToInt64());
 }

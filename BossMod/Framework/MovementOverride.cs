@@ -87,6 +87,7 @@ public sealed unsafe class MovementOverride(
 
     public bool IsMoving() => ActualMove != default;
     public bool IsMoveRequested() => UserMove != default;
+    public bool IsManualMoveRequested() => UserMove != default && !FollowPathActive();
 
     public bool IsForceUnblocked() => _tweaksConfig.MoveEscapeHatch switch
     {

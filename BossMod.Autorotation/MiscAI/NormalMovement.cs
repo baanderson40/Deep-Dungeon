@@ -96,9 +96,34 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
     private DateTime _lastDDRouteSampleAt;
     private int _ddRouteFloor = -1;
     private ulong _ddRouteTreasureGoalID;
+    private string? _ddPreviousTreasureRouteSummary;
     private readonly Queue<RouteSample> _ddRouteSamples = new();
+    private readonly Queue<CollisionSample> _collisionSamples = new();
+    private readonly List<CollisionRecoveryObstacle> _collisionRecoveryObstacles = [];
+    private DateTime _lastCollisionSampleAt;
+    private int _collisionRecoveryFloor = -1;
+    private ushort _collisionRecoveryTerritory;
+    private DeepDungeonState.DungeonType _collisionRecoveryDungeon;
+    private WPos _collisionStallAnchor;
+    private bool _hasCollisionStallAnchor;
+    private DateTime _collisionProgressResetSince;
+    private int _collisionRecoveryAttempts;
+    private int _nextCollisionRecoveryID;
+    private bool _collisionBudgetExhaustedLogged;
 
     private readonly record struct RouteSample(DateTime At, WPos Position, float HeightY, long Decision, WPos? Destination, WPos? SearchGoal, ulong Interaction, Vector3? RequestedDirection, WDir RouteDirection);
+    private readonly record struct CollisionSample(DateTime At, WPos Position, Vector3 DesiredDirection, bool Commanded, long MovementSampleAt);
+    private sealed class CollisionRecoveryObstacle(int id, WPos origin, WPos center, float radius, DateTime expiresAt, long decisionSequenceAtCreation)
+    {
+        public int ID = id;
+        public WPos Origin = origin;
+        public WPos Center = center;
+        public float Radius = radius;
+        public DateTime ExpiresAt = expiresAt;
+        public long DecisionSequenceAtCreation = decisionSequenceAtCreation;
+        public bool ProgressLogged;
+        public bool ReplanLogged;
+    }
 
     private DateTime? TimeToMove;
     private bool? _delayMovementIsDodge;
@@ -220,6 +245,7 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
             _ddObjectiveDiagnosticRequestedAt = default;
             _ddObjectiveDiagnosticReason = null;
             _ddObjectiveDiagnosticRequested = false;
+            _ddPreviousTreasureRouteSummary = null;
         }
         if (World.DeepDungeon.DungeonId == DeepDungeonState.DungeonType.None)
         {
@@ -232,6 +258,7 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
             _ddPathDiagnosticPending = false;
             _ddPathDiagnosticRequested = false;
             _ddObjectiveDiagnosticRequested = false;
+            _ddPreviousTreasureRouteSummary = null;
             _ddRouteSamples.Clear();
             _ddRouteTreasureGoalID = 0;
             return;
@@ -247,6 +274,7 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
             _ddPathDiagnosticPending = false;
             _ddPathDiagnosticRequested = false;
             _ddObjectiveDiagnosticRequested = false;
+            _ddPreviousTreasureRouteSummary = null;
             _ddRouteSamples.Clear();
             _ddRouteTreasureGoalID = 0;
             return;
@@ -282,6 +310,8 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
         if (_ddRouteTreasureGoalID != Hints.DeepDungeonTreasureGoalID)
         {
             // Never combine route reversals from one chest with a newly selected chest.
+            if (_ddRouteTreasureGoalID != 0 && _ddRouteSamples.Count > 1)
+                _ddPreviousTreasureRouteSummary = $"actor={_ddRouteTreasureGoalID},{SummarizeRouteSamples()}";
             _ddRouteTreasureGoalID = Hints.DeepDungeonTreasureGoalID;
             _ddRouteSamples.Clear();
             _lastDDRouteSampleAt = default;
@@ -320,6 +350,10 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
         var goalWaypoint = ScoreAt(decision.NextWaypoint);
         var goalInteraction = ScoreAt(interaction?.Position);
         var destinationDistance = decision.Destination is { } destination ? (destination - Player.Position).Length() : float.NaN;
+        var intermediateWaypoint = decision.HasIntermediateWaypoint;
+        var arrivalRadius = NavigationDecision.DestinationArrivalRadius(intermediateWaypoint);
+        var playerCell = decision.GridPosition(Player.Position);
+        var destinationCell = decision.Destination is { } diagnosticDestination ? decision.GridPosition(diagnosticDestination) : (-1, -1);
         var interactionDistance = interaction != null ? (interaction.Position - Player.Position).Length() : float.NaN;
         var movement = Manager.MovementDiagnostic;
         var movementSampleAge = movement is { SampleAtMilliseconds: > 0 } sampleAge ? Environment.TickCount64 - sampleAge.SampleAtMilliseconds : long.MaxValue;
@@ -338,14 +372,19 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
 
         var pathTrace = hasNewPathTrace ? $" {decision.PathfindDiagnostic}" : "";
         var routeSummary = SummarizeRouteSamples();
+        var previousTreasureRoute = _ddPreviousTreasureRouteSummary is { } previousRoute ? $",previousTreasureRoute({previousRoute})" : "";
+        var collisionRecoverySummary = _collisionRecoveryObstacles.Count > 0
+            ? $"collisionRecovery(active=[{string.Join(",", _collisionRecoveryObstacles.Select(recovery => $"{recovery.ID}/remaining:{Math.Max(0, (recovery.ExpiresAt - now).TotalSeconds):F1}s"))}])"
+            : "collisionRecovery(active=none)";
         var movementSummary = movement is { SampleAtMilliseconds: > 0 } sample
             ? $"movementInput(ageMs={Environment.TickCount64 - sample.SampleAtMilliseconds},desiredWorldXYZ={FormatVector(sample.DesiredDirection)},userLeftForward=({sample.UserMove.X:F2},{sample.UserMove.Z:F2}),actualLeftForward=({sample.ActualMove.X:F2},{sample.ActualMove.Z:F2}),outputLeftForward=({sample.FinalOutput.X:F2},{sample.FinalOutput.Z:F2}),additive={sample.AdditiveInput},inputEnabled={sample.InputEnabled1}/{sample.InputEnabled2},allowed={sample.MovementAllowed},blocked={sample.MovementBlocked},interactionSuppressed={sample.InteractionMovementSuppressed}/target:{sample.InteractionTargetID}/ageMs:{Environment.TickCount64 - sample.InteractionSampleAtMilliseconds},followPath={sample.FollowPathActive},misdirection={sample.Misdirection},hooks={sample.HookCalls},nonzero={sample.NonzeroOutputs},zero={sample.ZeroOutputs})"
             : "movementInput=unavailable";
         var objectiveSnapshot = objectiveSnapshotReady ? $",objectiveSnapshot={_ddObjectiveDiagnosticReason}" : "";
-        Service.Log($"[AutoDD] movement diagnostic: classification={diagnosticKind}{objectiveSnapshot}, floor={World.DeepDungeon.Floor}, stationaryFor={stationaryFor.TotalSeconds:F0}s, playerXZ=(x:{Player.Position.X:F1},z:{Player.Position.Z:F1}),playerY={Player.PosRot.Y:F2},state={movementState},inCombat={Player.InCombat}, decision={decision.Sequence}, requestedAt={decision.RequestedAt:HH:mm:ss.fff}, builtAt={decision.BuildCompletedAt:HH:mm:ss.fff},diagnosticCompletedAt={decision.DiagnosticCompletedAt:HH:mm:ss.fff},requestAge={requestAge}, requestedPositionXZ=(x:{decision.RequestedPosition.X:F1},z:{decision.RequestedPosition.Z:F1}),requestedHeightY={decision.RequestedHeightY:F2}, pathDestination={FormatPosition(decision.PathfindDestination)},searchGoal={FormatPosition(decision.SearchGoalPosition)},effectiveDestination={FormatPosition(decision.Destination)}@{destinationDistance:F1}, nextWaypoint={FormatPosition(decision.NextWaypoint)}, decisionConsumedAge={decisionAge}, buildMs={decision.BuildDurationMs:F1}, diagnosticMs={decision.DiagnosticDurationMs:F1}, timeToGoal={decision.TimeToGoal:F1}s, leeway={decision.LeewaySeconds:F1}s, interaction={(interaction == null ? "none" : $"{interaction.InstanceID}@{interactionDistance:F1}")}, goals={Hints.GoalZones.Count}, forbidden={Hints.ForbiddenZones.Count}, goalScores(here={goalHere?.ToString("F2") ?? "n/a"},destination={goalDestination?.ToString("F2") ?? "n/a"},waypoint={goalWaypoint?.ToString("F2") ?? "n/a"},interaction={goalInteraction?.ToString("F2") ?? "n/a"}), casting={Player.CastInfo != null}, {movementSummary}, {routeSummary}.{pathTrace}");
+        Service.Log($"[AutoDD] movement diagnostic: classification={diagnosticKind}{objectiveSnapshot}, floor={World.DeepDungeon.Floor}, stationaryFor={stationaryFor.TotalSeconds:F0}s, playerXZ=(x:{Player.Position.X:F1},z:{Player.Position.Z:F1}),playerY={Player.PosRot.Y:F2},state={movementState},inCombat={Player.InCombat}, decision={decision.Sequence}, requestedAt={decision.RequestedAt:HH:mm:ss.fff}, builtAt={decision.BuildCompletedAt:HH:mm:ss.fff},diagnosticCompletedAt={decision.DiagnosticCompletedAt:HH:mm:ss.fff},requestAge={requestAge}, requestedPositionXZ=(x:{decision.RequestedPosition.X:F1},z:{decision.RequestedPosition.Z:F1}),requestedHeightY={decision.RequestedHeightY:F2}, pathDestination={FormatPosition(decision.PathfindDestination)},searchGoal={FormatPosition(decision.SearchGoalPosition)},effectiveDestination={FormatPosition(decision.Destination)}@{destinationDistance:F4},arrivalMode={(intermediateWaypoint ? "intermediate" : "final")},arrivalRadius={arrivalRadius:F3},grid(player={playerCell.Item1}:{playerCell.Item2},destination={destinationCell.Item1}:{destinationCell.Item2}),nextWaypoint={FormatPosition(decision.NextWaypoint)}, decisionConsumedAge={decisionAge}, buildMs={decision.BuildDurationMs:F1}, diagnosticMs={decision.DiagnosticDurationMs:F1}, timeToGoal={decision.TimeToGoal:F1}s, leeway={decision.LeewaySeconds:F1}s, interaction={(interaction == null ? "none" : $"{interaction.InstanceID}@{interactionDistance:F1}")}, goals={Hints.GoalZones.Count}, forbidden={Hints.ForbiddenZones.Count}, goalScores(here={goalHere?.ToString("F2") ?? "n/a"},destination={goalDestination?.ToString("F2") ?? "n/a"},waypoint={goalWaypoint?.ToString("F2") ?? "n/a"},interaction={goalInteraction?.ToString("F2") ?? "n/a"}), casting={Player.CastInfo != null},movementPathCorrelation=asynchronous, {movementSummary}, {routeSummary}{previousTreasureRoute}, {collisionRecoverySummary}.{pathTrace}");
         if (hasNewPathTrace)
         {
             _lastDDPathDiagnosticLoggedAt = decision.PathfindDiagnosticAt;
+            _ddPreviousTreasureRouteSummary = null;
             if (objectiveSnapshotReady)
             {
                 _ddObjectiveDiagnosticReason = null;
@@ -366,6 +405,7 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
         var traveled = 0f;
         var verticalTravel = 0f;
         var destinationChanges = 0;
+        var subYardDestinationChanges = 0;
         var interactionChanges = 0;
         var routeDirections = new WDir[samples.Length];
         var nonzeroHints = 0;
@@ -373,8 +413,14 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
         {
             traveled += (samples[i].Position - samples[i - 1].Position).Length();
             verticalTravel += MathF.Abs(samples[i].HeightY - samples[i - 1].HeightY);
-            if (samples[i].Destination is { } current && samples[i - 1].Destination is { } previous && (current - previous).LengthSq() > 4)
-                ++destinationChanges;
+            if (samples[i].Destination is { } current && samples[i - 1].Destination is { } previous)
+            {
+                var destinationChange = (current - previous).Length();
+                if (destinationChange > 2)
+                    ++destinationChanges;
+                else if (destinationChange > 0.1f)
+                    ++subYardDestinationChanges;
+            }
             if (samples[i].Interaction != samples[i - 1].Interaction)
                 ++interactionChanges;
             routeDirections[i] = samples[i].RouteDirection;
@@ -387,11 +433,203 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
         var verticalNet = samples[^1].HeightY - samples[0].HeightY;
         var decisions = string.Join(",", samples.Where((sample, index) => index == 0 || index == samples.Length - 1 || sample.Decision != samples[index - 1].Decision)
             .Take(5).Select(sample => $"{sample.Decision}@{(sample.Destination is { } d ? $"x:{d.X:F1},z:{d.Z:F1}" : "none")}/interact:{sample.Interaction}"));
-        return $"route(samples={samples.Length},span={(samples[^1].At - samples[0].At).TotalSeconds:F1}s,netXZ={net:F2},netY={verticalNet:F2},traveledXZ={traveled:F2},verticalTravel={verticalTravel:F2},reversals={reversals},destinationChanges={destinationChanges},interactionChanges={interactionChanges},nonzeroHints={nonzeroHints},decisions=[{decisions}])";
+        return $"route(samples={samples.Length},span={(samples[^1].At - samples[0].At).TotalSeconds:F1}s,netXZ={net:F2},netY={verticalNet:F2},traveledXZ={traveled:F2},verticalTravel={verticalTravel:F2},reversals={reversals},destinationChanges={destinationChanges},subYardDestinationChanges={subYardDestinationChanges},interactionChanges={interactionChanges},nonzeroHints={nonzeroHints},decisions=[{decisions}])";
+    }
+
+    private void ResetCollisionRecovery(bool clearObstacles)
+    {
+        _collisionSamples.Clear();
+        _lastCollisionSampleAt = default;
+        if (!clearObstacles)
+            return;
+        _collisionRecoveryObstacles.Clear();
+        _collisionRecoveryAttempts = 0;
+        _hasCollisionStallAnchor = false;
+        _collisionProgressResetSince = default;
+        _collisionBudgetExhaustedLogged = false;
+    }
+
+    private void UpdateDeepDungeonCollisionRecovery(bool pathfindingSelected)
+    {
+        var floor = World.DeepDungeon.Floor;
+        var territory = World.CurrentZone;
+        var dungeon = World.DeepDungeon.DungeonId;
+        if (_collisionRecoveryFloor != floor || _collisionRecoveryTerritory != territory || _collisionRecoveryDungeon != dungeon)
+        {
+            _collisionRecoveryFloor = floor;
+            _collisionRecoveryTerritory = territory;
+            _collisionRecoveryDungeon = dungeon;
+            ResetCollisionRecovery(clearObstacles: true);
+        }
+
+        var now = World.CurrentTime;
+        foreach (var activeRecovery in _collisionRecoveryObstacles.ToArray())
+        {
+            if (!activeRecovery.ReplanLogged && _lastDecision.Sequence > activeRecovery.DecisionSequenceAtCreation)
+            {
+                activeRecovery.ReplanLogged = true;
+                var newDirection = _lastDecision.Destination is { } replannedDestination ? (replannedDestination - Player.Position).Normalized() : default;
+                var directionChanged = newDirection != default && newDirection.Dot((activeRecovery.Center - activeRecovery.Origin).Normalized()) < 0.8f;
+                Service.Log($"[AutoDD] collision recovery replan: recovery={activeRecovery.ID}, decision={_lastDecision.Sequence}, destination={_lastDecision.Destination?.ToString() ?? "none"}, searchGoal={_lastDecision.SearchGoalPosition?.ToString() ?? "none"}, approachChanged={directionChanged}, result={(_lastDecision.Destination == null ? "no-route; fail-closed" : "destination-selected")}, obstacleAge={(now - activeRecovery.ExpiresAt + DeepDungeonPolicy.MovementCollisionObstacleLifetime).TotalSeconds:F2}s.");
+            }
+            if (!activeRecovery.ProgressLogged && (Player.Position - activeRecovery.Origin).Length() >= 1.0f)
+            {
+                activeRecovery.ProgressLogged = true;
+                Service.Log($"[AutoDD] collision recovery movement resumed: recovery={activeRecovery.ID}, displacement={(Player.Position - activeRecovery.Origin).Length():F2}y, obstacle remains until expiry.");
+            }
+            if (now < activeRecovery.ExpiresAt)
+                continue;
+            _collisionRecoveryObstacles.Remove(activeRecovery);
+            Service.Log($"[AutoDD] collision recovery obstacle expired: recovery={activeRecovery.ID}, lifetime={DeepDungeonPolicy.MovementCollisionObstacleLifetime.TotalSeconds:F0}s.");
+        }
+
+        var movement = Manager.MovementDiagnostic;
+        var basicContextValid = World.DeepDungeon.DungeonId != DeepDungeonState.DungeonType.None && pathfindingSelected
+            && Hints.ForcedMovement == null && !World.Client.Flying && !Player.IsDead && !Player.InCombat
+            && Player.CastInfo == null && Player.PendingKnockbacks.Count == 0 && Hints.InteractWithTarget == null;
+        if (!basicContextValid)
+        {
+            ResetCollisionRecovery(clearObstacles: true);
+            return;
+        }
+
+        foreach (var activeRecovery in _collisionRecoveryObstacles)
+            Hints.TemporaryObstacles.Add(ShapeDistance.Circle(activeRecovery.Center, activeRecovery.Radius));
+
+        var tickNow = Environment.TickCount64;
+        var sampleAge = movement is { SampleAtMilliseconds: > 0 } sample ? tickNow - sample.SampleAtMilliseconds : long.MaxValue;
+        var eligibleTelemetry = movement is { } snapshot && sampleAge is >= 0 and <= 300
+            && snapshot.MovementAllowed && !snapshot.MovementBlocked && !snapshot.InteractionMovementSuppressed
+            && !snapshot.FollowPathActive && !snapshot.Misdirection
+            && snapshot.InputEnabled1 && snapshot.InputEnabled2 && snapshot.UserMove == default
+            && snapshot.DesiredDirection is { } desired && new WDir(desired.X, desired.Z).LengthSq() > 0.01f;
+        if (!eligibleTelemetry)
+        {
+            _collisionSamples.Clear();
+            _lastCollisionSampleAt = default;
+            return;
+        }
+
+        if (_lastCollisionSampleAt != default && now - _lastCollisionSampleAt < DeepDungeonPolicy.MovementCollisionSampleInterval)
+            return;
+        if (_lastCollisionSampleAt != default && now - _lastCollisionSampleAt > DeepDungeonPolicy.MovementCollisionSampleInterval * 2)
+            _collisionSamples.Clear();
+
+        var movementSnapshot = movement!.Value;
+        var desiredDirection = movementSnapshot.DesiredDirection!.Value;
+        var commanded = movementSnapshot.FinalOutput != default;
+        _collisionSamples.Enqueue(new(now, Player.Position, desiredDirection, commanded, movementSnapshot.SampleAtMilliseconds));
+        while (_collisionSamples.Count > 0 && now - _collisionSamples.Peek().At > DeepDungeonPolicy.MovementCollisionRecoveryWindow + DeepDungeonPolicy.MovementCollisionSampleInterval)
+            _collisionSamples.Dequeue();
+        _lastCollisionSampleAt = now;
+
+        if (_collisionSamples.Count < DeepDungeonPolicy.MovementCollisionMinimumSamples)
+            return;
+
+        var samples = _collisionSamples.ToArray();
+        var sampleSpan = samples[^1].At - samples[0].At;
+        var traveled = 0f;
+        var commandedCount = 0;
+        var directionSum = Vector2.Zero;
+        for (var i = 0; i < samples.Length; ++i)
+        {
+            if (samples[i].Commanded)
+            {
+                ++commandedCount;
+                var direction = new Vector2(samples[i].DesiredDirection.X, samples[i].DesiredDirection.Z);
+                if (direction.LengthSquared() > 0.0001f)
+                    directionSum += Vector2.Normalize(direction);
+            }
+            if (i > 0)
+                traveled += (samples[i].Position - samples[i - 1].Position).Length();
+        }
+        var commandRatio = (float)commandedCount / samples.Length;
+        var directionCoherence = commandedCount > 0 ? directionSum.Length() / commandedCount : 0;
+        if (!DeepDungeonPolicy.ShouldRecoverFromMovementCollision(true, sampleSpan, samples.Length, traveled, commandRatio, directionCoherence))
+            return;
+
+        var netDisplacement = (samples[^1].Position - samples[0].Position).Length();
+        var finalDirection = new Vector2(directionSum.X, directionSum.Y);
+        if (finalDirection.LengthSquared() < 0.0001f)
+            return;
+        finalDirection = Vector2.Normalize(finalDirection);
+        var approach = new WDir(finalDirection.X, finalDirection.Y);
+        var destination = _lastDecision.Destination;
+        if (destination == null || (destination.Value - Player.Position).Length() <= NavigationDecision.DestinationArrivalRadius(_lastDecision.HasIntermediateWaypoint)
+            || approach.Dot((destination.Value - Player.Position).Normalized()) <= 0.3f)
+        {
+            _collisionSamples.Clear();
+            return;
+        }
+
+        if (!_hasCollisionStallAnchor)
+        {
+            _collisionStallAnchor = Player.Position;
+            _hasCollisionStallAnchor = true;
+        }
+        else if ((Player.Position - _collisionStallAnchor).Length() >= 2.0f)
+        {
+            _collisionProgressResetSince = _collisionProgressResetSince == default ? now : _collisionProgressResetSince;
+            if (now - _collisionProgressResetSince >= TimeSpan.FromSeconds(1))
+            {
+                _collisionStallAnchor = Player.Position;
+                _collisionRecoveryAttempts = 0;
+                _collisionProgressResetSince = default;
+                _collisionBudgetExhaustedLogged = false;
+            }
+        }
+        else
+            _collisionProgressResetSince = default;
+
+        if (_collisionRecoveryAttempts >= DeepDungeonPolicy.MovementCollisionMaximumAttempts
+            || _collisionRecoveryObstacles.Count >= DeepDungeonPolicy.MovementCollisionMaximumAttempts)
+        {
+            if (!_collisionBudgetExhaustedLogged)
+            {
+                _collisionBudgetExhaustedLogged = true;
+                Service.Log($"[AutoDD] collision recovery unresolved: floor={floor}, attempts={_collisionRecoveryAttempts}/{DeepDungeonPolicy.MovementCollisionMaximumAttempts}; no further temporary obstacles will be added for this stall.");
+            }
+            _collisionSamples.Clear();
+            return;
+        }
+
+        var recoveryID = ++_nextCollisionRecoveryID;
+        Service.Log($"[AutoDD] suspected physical collision: recovery={recoveryID}, floor={floor}, territory={territory}, objectiveTreasure={Hints.DeepDungeonTreasureGoalID}, position=({Player.Position.X:F2},{Player.PosRot.Y:F2},{Player.Position.Z:F2}),window={sampleSpan.TotalSeconds:F1}s,samples={samples.Length},netXZ={netDisplacement:F2},traveledXZ={traveled:F2},commandedRatio={commandRatio:F2},directionCoherence={directionCoherence:F2},approach=({approach.X:F2},{approach.Z:F2}),destinationDistance={(destination.Value - Player.Position).Length():F4},decision={_lastDecision.Sequence},movementSampleAgeMs={sampleAge}.");
+        var attemptNumber = ++_collisionRecoveryAttempts;
+
+        var clearance = _lastDecision.PathfindMapResolution > 0 ? _lastDecision.PathfindMapResolution : 0.5f;
+        var obstacleRadius = MathF.Max(0.75f, 1.5f * clearance);
+        var offset = Player.HitboxRadius + obstacleRadius + clearance;
+        var center = Player.Position + approach * offset;
+        var playerDistance = (center - Player.Position).Length();
+        if (!DeepDungeonPolicy.IsMovementCollisionObstacleClearOfPlayer(playerDistance, Player.HitboxRadius, obstacleRadius, clearance))
+        {
+            Service.Log($"[AutoDD] collision recovery obstacle rejected: recovery={recoveryID}, attempt={attemptNumber}/{DeepDungeonPolicy.MovementCollisionMaximumAttempts}, reason=overlaps-player, center={center}, distance={playerDistance:F2}, radius={obstacleRadius:F2}.");
+            _collisionSamples.Clear();
+            return;
+        }
+
+        if (_collisionRecoveryObstacles.Any(existing => (existing.Center - center).Length() <= existing.Radius + obstacleRadius))
+        {
+            Service.Log($"[AutoDD] collision recovery obstacle rejected: recovery={recoveryID}, attempt={attemptNumber}/{DeepDungeonPolicy.MovementCollisionMaximumAttempts}, reason=duplicate-or-overlapping-footprint, center={center}, radius={obstacleRadius:F2}.");
+            _collisionSamples.Clear();
+            return;
+        }
+
+        var recoveryObstacle = new CollisionRecoveryObstacle(recoveryID, Player.Position, center, obstacleRadius,
+            now + DeepDungeonPolicy.MovementCollisionObstacleLifetime, _nextDecisionSequence);
+        _collisionRecoveryObstacles.Add(recoveryObstacle);
+        Hints.TemporaryObstacles.Add(ShapeDistance.Circle(center, obstacleRadius));
+        Hints.DeepDungeonDiagnosticRequest ??= $"collision-recovery id={recoveryID},attempt={attemptNumber},position={center}";
+        Service.Log($"[AutoDD] collision recovery obstacle added: recovery={recoveryID}, attempt={attemptNumber}/{DeepDungeonPolicy.MovementCollisionMaximumAttempts}, center={center}, radius={obstacleRadius:F2}, expiresIn={DeepDungeonPolicy.MovementCollisionObstacleLifetime.TotalSeconds:F0}s, playerCellExcluded=True, replanRequested=true.");
+        _collisionSamples.Clear();
     }
 
     public override void Execute(StrategyValues strategy, ref Actor? primaryTarget, float estimatedAnimLockDelay, bool isMoving)
     {
+        var destinationStrategy = strategy.Option(Track.Destination).As<DestinationStrategy>();
+        UpdateDeepDungeonCollisionRecovery(destinationStrategy == DestinationStrategy.Pathfind);
+
         // do nothing if we're already being moved by some other module (i.e. quest battle pathfinding)
         if (Hints.ForcedMovement != null)
             return;
@@ -488,7 +726,6 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
 
         var speed = World.Client.MoveSpeed;
         var destinationOpt = strategy.Option(Track.Destination);
-        var destinationStrategy = destinationOpt.As<DestinationStrategy>();
         var cushionStrategy = strategy.Option(Track.ForbiddenZoneCushion).As<ForbiddenZoneCushionStrategy>();
         var cushionSize = cushionStrategy switch
         {
@@ -604,7 +841,7 @@ public sealed class NormalMovement(RotationModuleManager manager, Actor player) 
 
         var dir = navi.Destination.Value - Player.Position;
         var distSq = dir.LengthSq();
-        if (distSq <= 0.01f)
+        if (NavigationDecision.ReachedDestination(distSq, navi.HasIntermediateWaypoint))
         {
             // we're already very close to destination
             Hints.ForcedMovement = default;

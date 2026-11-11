@@ -24,9 +24,35 @@ public struct NavigationDecision
     public WPos? NextWaypoint;
     public WPos? PathfindDestination;
     public WPos? SearchGoalPosition;
+    public WPos PathfindMapCenter;
+    public WDir PathfindMapLocalZDivRes;
+    public float PathfindMapResolution;
+    public int PathfindMapWidth;
+    public int PathfindMapHeight;
     //public float NextTurn; // > 0 if we turn left after reaching first waypoint, < 0 if we turn right, 0 otherwise (no more waypoints)
     public float LeewaySeconds; // can be used for finishing casts / slidecasting etc.
     public float TimeToGoal;
+
+    public bool HasIntermediateWaypoint => NextWaypoint != null && Destination == PathfindDestination;
+
+    public (int x, int y) GridPosition(WPos position)
+    {
+        var offset = position - PathfindMapCenter;
+        var fracX = PathfindMapWidth / 2 + offset.Dot(PathfindMapLocalZDivRes.OrthoL());
+        var fracY = PathfindMapHeight / 2 + offset.Dot(PathfindMapLocalZDivRes);
+        return ((int)MathF.Floor(fracX), (int)MathF.Floor(fracY));
+    }
+
+    // Intermediate waypoints are validated segment endpoints, not stopping goals. Keep
+    // moving almost to the endpoint so NormalMovement's arrival deadzone cannot strand
+    // the player before the next path segment is selected.
+    public static float DestinationArrivalRadius(bool hasNextWaypoint) => hasNextWaypoint ? 0.01f : 0.1f;
+
+    public static bool ReachedDestination(float distanceSq, bool hasNextWaypoint)
+    {
+        var radius = DestinationArrivalRadius(hasNextWaypoint);
+        return distanceSq <= radius * radius;
+    }
 
     public TimeSpan RasterizeTime;
     public TimeSpan PathfindTime;
@@ -86,7 +112,7 @@ public struct NavigationDecision
         var searchGoalPosition = ctx.ThetaStar.CellCenter(bestNodeIndex);
         var diagnostic = collectDiagnostics ? BuildPathfindDiagnostic(ctx, hints, playerPosition, requestedHeightY, waypoints.first, searchGoalPosition, comparisonGoal, currentTime, emergencyMode, bestNodeIndex) : null;
         var diagnosticFinish = DateTime.Now;
-        return new NavigationDecision() { Destination = waypoints.first, NextWaypoint = waypoints.second, PathfindDestination = waypoints.first, SearchGoalPosition = searchGoalPosition, LeewaySeconds = bestNode.PathLeeway, TimeToGoal = bestNode.GScore, PathfindTime = finishTime - rasterFinish, RasterizeTime = rasterFinish - startTime, TotalTime = finishTime - startTime, PathfindDiagnostic = diagnostic, PathfindDiagnosticAt = collectDiagnostics ? currentTime : default, Sequence = sequence, RequestedAt = currentTime, RequestedPosition = playerPosition, RequestedHeightY = requestedHeightY, BuildDurationMs = (finishTime - startTime).TotalMilliseconds, DiagnosticDurationMs = (diagnosticFinish - finishTime).TotalMilliseconds, BuildCompletedAt = finishTime, DiagnosticCompletedAt = diagnosticFinish };
+        return new NavigationDecision() { Destination = waypoints.first, NextWaypoint = waypoints.second, PathfindDestination = waypoints.first, SearchGoalPosition = searchGoalPosition, PathfindMapCenter = ctx.Map.Center, PathfindMapLocalZDivRes = ctx.Map.LocalZDivRes, PathfindMapResolution = ctx.Map.Resolution, PathfindMapWidth = ctx.Map.Width, PathfindMapHeight = ctx.Map.Height, LeewaySeconds = bestNode.PathLeeway, TimeToGoal = bestNode.GScore, PathfindTime = finishTime - rasterFinish, RasterizeTime = rasterFinish - startTime, TotalTime = finishTime - startTime, PathfindDiagnostic = diagnostic, PathfindDiagnosticAt = collectDiagnostics ? currentTime : default, Sequence = sequence, RequestedAt = currentTime, RequestedPosition = playerPosition, RequestedHeightY = requestedHeightY, BuildDurationMs = (finishTime - startTime).TotalMilliseconds, DiagnosticDurationMs = (diagnosticFinish - finishTime).TotalMilliseconds, BuildCompletedAt = finishTime, DiagnosticCompletedAt = diagnosticFinish };
     }
 
     public static Task<NavigationDecision> BuildAsync(Context ctx, DateTime currentTime, AIHints hints, WPos playerPos, float playerSpeed, float rtt, float spaceCushion, bool collectDiagnostics = false, long sequence = 0, float requestedHeightY = 0, WPos? comparisonGoal = null)
@@ -624,7 +650,7 @@ public struct NavigationDecision
                 // those endpoints with cell centers can move the issued segment through a
                 // blocked corner, even though the searched segment was clear.
                 var dest = pf.NodePosition(cell);
-                var next = pf.NodePosition(nextCell);
+                var next = nextCell != cell ? pf.NodePosition(nextCell) : (WPos?)null;
                 return (dest, next);
             }
             nextCell = cell;

@@ -111,7 +111,7 @@ public sealed class AutoDDConfig : ConfigNode, IAutoDungeonAutorotationConfig
                 new(PomanderID.Flight, () => AutoFlight, value => AutoFlight = value, "Use before eligible floor transitions; may spend last charge. EO uses Proto-Flight."),
                 new(PomanderID.Fortune, () => AutoFortune, value => AutoFortune = value, "Use at floor start when its effect is inactive; may spend last charge. EO uses Proto-Fortune."),
                 new(PomanderID.Intuition, () => AutoIntuition, value => AutoIntuition = value, "Use once per normal floor if detection is inactive and hoard not found. EO uses Proto-Intuition."),
-                new(PomanderID.Witching, () => AutoWitching, value => AutoWitching = value, "Use on large pulls; one proposal per pull, last charge allowed, solo-only. EO uses Proto-Witching."),
+                new(PomanderID.Witching, () => AutoWitching, value => AutoWitching = value, "Use on large pulls; one proposal per pull, last charge allowed. EO uses Proto-Witching."),
                 new(PomanderID.ProtoStrength, () => MaintainStrength, value => MaintainStrength = value, "Uses the shared Strength maintenance policy."),
                 new(PomanderID.ProtoSteel, () => MaintainSteel, value => MaintainSteel = value, "Uses the shared Steel maintenance policy."),
                 new(PomanderID.ProtoRaising, () => MaintainRaising, value => MaintainRaising = value, "Uses the shared Raising maintenance policy."),

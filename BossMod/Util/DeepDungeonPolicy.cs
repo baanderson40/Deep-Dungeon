@@ -176,7 +176,7 @@ internal static class DeepDungeonPolicy
         };
 
     internal static bool CanMaintainPomander(
-        bool maintenanceEnabled, bool autoDDEnabled, bool floorReady, bool alive, bool solo, bool itemPenalty,
+        bool maintenanceEnabled, bool autoDDEnabled, bool floorReady, bool alive, bool itemPenalty,
         bool validSlot, byte stock, bool usable, bool bossFloor, bool allowLastCharge, bool skipBossFloor, bool alreadyUsedThisFloor,
         bool effectActive, bool requestPending, bool outcomeUnknown,
         out string reason)
@@ -185,7 +185,6 @@ internal static class DeepDungeonPolicy
             : !autoDDEnabled ? "AutoDD disabled"
             : !floorReady ? "floor not initialized"
             : !alive ? "player dead"
-            : !solo ? "not solo"
             : itemPenalty ? "Item Penalty"
             : !validSlot ? "slot unavailable"
             : skipBossFloor && bossFloor ? "boss floor"
@@ -355,6 +354,7 @@ internal static class DeepDungeonPolicy
     internal static readonly TimeSpan FloorStartPomanderWindow = TimeSpan.FromSeconds(45);
     internal static readonly TimeSpan TreasureRecoveryCooldown = TimeSpan.FromSeconds(60);
     internal static readonly TimeSpan TreasureStallThreshold = TimeSpan.FromSeconds(30);
+    internal static readonly TimeSpan TreasureStallDiagnosticThreshold = TimeSpan.FromSeconds(10);
     internal static readonly TimeSpan TreasureOscillationThreshold = TimeSpan.FromSeconds(15);
     internal static readonly TimeSpan TreasureSelectionContinuity = TimeSpan.FromMilliseconds(250);
     internal static readonly TimeSpan HoHPomanderProposalTimeout = TimeSpan.FromSeconds(5);
@@ -366,8 +366,8 @@ internal static class DeepDungeonPolicy
     internal static bool WasPomanderAvailableAtFloorEntry(bool entrySnapshotReady, int entryCount)
         => entrySnapshotReady && entryCount > 0;
 
-    internal static bool ShouldAutoUseWitching(bool enabled, bool bossFloor, int aggroCount, int threshold, bool validSlot, int stock, bool usable, bool solo, bool itemPenalty, bool alreadyHandled)
-        => enabled && !bossFloor && threshold > 0 && aggroCount >= threshold && validSlot && stock > 0 && usable && solo && !itemPenalty && !alreadyHandled;
+    internal static bool ShouldAutoUseWitching(bool enabled, bool bossFloor, int aggroCount, int threshold, bool validSlot, int stock, bool usable, bool itemPenalty, bool alreadyHandled)
+        => enabled && !bossFloor && threshold > 0 && aggroCount >= threshold && validSlot && stock > 0 && usable && !itemPenalty && !alreadyHandled;
 
     internal static bool ShouldDeferTreasureForOscillation(bool oscillating, TimeSpan noProgressFor, bool roomObjective, bool manualNavigation,
         bool inCombat, bool casting, bool interactionInRange)
@@ -388,8 +388,39 @@ internal static class DeepDungeonPolicy
         => signalActor != 0 && signalActor == selectedActor && signalFloor == currentFloor && signalAt != default
             && now >= signalAt && now - signalAt <= TreasureOscillationSignalMaxAge;
 
-    internal static bool ShouldRequestDeepDungeonLeave(bool completionConfirmed, bool sourceTerritoryMatches, bool playerReady, bool transitioning)
-        => completionConfirmed && sourceTerritoryMatches && playerReady && !transitioning;
+    internal static bool ShouldRequestDeepDungeonLeave(bool completionConfirmed, bool sourceTerritoryMatches, bool playerReady, bool transitioning, bool screenReady)
+        => completionConfirmed && sourceTerritoryMatches && playerReady && !transitioning && screenReady;
+
+    internal static bool CanSearchWaitingRoomExit(bool screenReady, bool transitioning)
+        => screenReady && !transitioning;
+
+    internal static readonly TimeSpan WaitingRoomExitDiscoveryTimeout = TimeSpan.FromSeconds(30);
+    internal static readonly TimeSpan WaitingRoomExitPollInterval = TimeSpan.FromMilliseconds(250);
+    internal static readonly TimeSpan WaitingRoomExitStatusInterval = TimeSpan.FromSeconds(5);
+
+    internal static readonly TimeSpan MovementCollisionRecoveryWindow = TimeSpan.FromSeconds(3);
+    internal static readonly TimeSpan MovementCollisionObstacleLifetime = TimeSpan.FromSeconds(10);
+    internal static readonly TimeSpan MovementCollisionSampleInterval = TimeSpan.FromMilliseconds(250);
+    internal const int MovementCollisionMinimumSamples = 8;
+    internal const int MovementCollisionMaximumAttempts = 3;
+    internal const float MovementCollisionMaxTravel = 0.25f;
+    internal const float MovementCollisionMinCommandRatio = 0.8f;
+    internal const float MovementCollisionMinDirectionCoherence = 0.7f;
+
+    internal static bool ShouldRecoverFromMovementCollision(bool eligible, TimeSpan sampleSpan, int sampleCount, float traveled,
+        float commandRatio, float directionCoherence)
+        => eligible && sampleSpan >= MovementCollisionRecoveryWindow && sampleCount >= MovementCollisionMinimumSamples
+            && traveled < MovementCollisionMaxTravel && commandRatio >= MovementCollisionMinCommandRatio
+            && directionCoherence >= MovementCollisionMinDirectionCoherence;
+
+    internal static bool IsMovementCollisionObstacleClearOfPlayer(float distance, float playerRadius, float obstacleRadius, float clearance)
+        => distance >= playerRadius + obstacleRadius + clearance;
+
+    internal static bool WaitingRoomExitDiscoveryExpired(DateTime startedAt, DateTime now)
+        => startedAt != default && now >= startedAt && now - startedAt >= WaitingRoomExitDiscoveryTimeout;
+
+    internal static bool ShouldPollWaitingRoomExit(bool screenReady, bool transitioning, DateTime now, DateTime deadline, DateTime nextPollAt)
+        => screenReady && !transitioning && now < deadline && now >= nextPollAt;
 
     internal static uint WaitingRoomExitBaseID(DeepDungeonState.DungeonType dungeon, ushort territory)
         => (dungeon, territory) switch
@@ -402,8 +433,18 @@ internal static class DeepDungeonPolicy
     internal static bool IsVerifiedWaitingRoomExit(DeepDungeonState.DungeonType dungeon, ushort territory, uint baseID, bool targetable, int candidateCount)
         => WaitingRoomExitBaseID(dungeon, territory) == baseID && baseID != 0 && targetable && candidateCount == 1;
 
+    internal static bool IsWaitingRoomExitObjectValid(DeepDungeonState.DungeonType dungeon, ushort territory, uint baseID, bool targetable)
+        => WaitingRoomExitBaseID(dungeon, territory) == baseID && baseID != 0 && targetable;
+
+    internal static bool IsUnambiguousNearestWaitingRoomExit(float nearestDistance, float secondNearestDistance, float requiredMargin = 2.0f)
+        => float.IsFinite(nearestDistance) && float.IsFinite(secondNearestDistance) && nearestDistance >= 0
+            && secondNearestDistance - nearestDistance >= requiredMargin;
+
     internal static bool ShouldStartDeparturePath(bool navReady, bool pathRunning, bool pathfindInProgress, bool validExit, bool validPlayer)
         => navReady && !pathRunning && !pathfindInProgress && validExit && validPlayer;
+
+    internal static bool ShouldPauseDepartureForManualInput(bool manualInput, DateTime now, DateTime manualInputResumeAt)
+        => manualInput || manualInputResumeAt != default && now < manualInputResumeAt;
 
     internal static bool OwnsDeparturePath(bool pathRunning, int waypointCount, float endpointDistance, float tolerance)
         => pathRunning && waypointCount > 0 && endpointDistance <= tolerance;
@@ -582,7 +623,7 @@ internal static class DeepDungeonPolicy
         return true;
     }
 
-    internal static bool CanAutoUsePomander(bool validDungeonAndAction, bool validSlot, byte stock, bool usable, bool solo, bool itemPenalty, bool enabledByConfig, bool requiresPox, bool hasPox, out string reason)
+    internal static bool CanAutoUsePomander(bool validDungeonAndAction, bool validSlot, byte stock, bool usable, bool itemPenalty, bool enabledByConfig, bool requiresPox, bool hasPox, out string reason)
     {
         if (!validDungeonAndAction)
             reason = "invalid dungeon or pomander";
@@ -592,8 +633,6 @@ internal static class DeepDungeonPolicy
             reason = "no stock";
         else if (!usable)
             reason = "game state marks pomander unusable";
-        else if (!solo)
-            reason = "party is not solo";
         else if (itemPenalty)
             reason = "Item Penalty active";
         else if (!enabledByConfig)

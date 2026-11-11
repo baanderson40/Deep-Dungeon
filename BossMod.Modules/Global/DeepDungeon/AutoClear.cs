@@ -115,6 +115,8 @@ public abstract partial class AutoClear : ZoneModule
         internal TimeSpan EligibleNoProgress;
         internal float BestDistance;
         internal WPos LastPlayerPosition;
+        internal bool DiagnosticAt10SecondsRequested;
+        internal bool DiagnosticBeforeDeferralRequested;
     }
     private readonly Dictionary<ulong, TreasureProgress> _treasureProgress = [];
 
@@ -942,11 +944,10 @@ public abstract partial class AutoClear : ZoneModule
         var slot = pid != PomanderID.None ? Palace.GetPomanderSlot(pid) : -1;
         var validSlot = slot is >= 0 and < DeepDungeonState.NumPomanderSlots;
         var state = validSlot ? Palace.Pomanders[slot] : default;
-        var solo = Palace.Party.Count(member => member.EntityId > 0) <= 1;
         var itemPenalty = player.FindStatus(SID.ItemPenalty) != null;
         if (!DeepDungeonPolicy.ShouldAutoUseWitching(
             _config.Enable && _config.AutoWitching && !BetweenFloors && _pomanderSnapshotReady,
-            bossFloor, aggroCount, threshold, validSlot, state.Count, state.Usable, solo, itemPenalty, _autoWitchingPullHandled))
+            bossFloor, aggroCount, threshold, validSlot, state.Count, state.Usable, itemPenalty, _autoWitchingPullHandled))
             return;
         if (HasPomanderAction(hints))
             return;
@@ -1157,9 +1158,8 @@ public abstract partial class AutoClear : ZoneModule
             var safetySlotForSight = Palace.GetPomanderSlot(MaintenancePomander(DeepDungeonPolicy.PomanderMaintenanceKind.Safety));
             var safetyAvailableForSight = safetySlotForSight is >= 0 and < DeepDungeonState.NumPomanderSlots
                 && Palace.Pomanders[safetySlotForSight].Count > 0 && Palace.Pomanders[safetySlotForSight].Usable;
-            var solo = Palace.Party.Count(member => member.EntityId > 0) <= 1;
             var eligible = DeepDungeonPolicy.CanMaintainPomander(
-                configured, _config.Enable, !BetweenFloors && _pomanderSnapshotReady, !player.IsDead, solo,
+                configured, _config.Enable, !BetweenFloors && _pomanderSnapshotReady, !player.IsDead,
                 !DeepDungeonPolicy.SerenityMayIgnoreItemPenalty(kind) && player.FindStatus(SID.ItemPenalty) != null,
                 validSlot, state.Count, state.Usable, bossFloor,
                 kind is DeepDungeonPolicy.PomanderMaintenanceKind.Raising or DeepDungeonPolicy.PomanderMaintenanceKind.Safety or DeepDungeonPolicy.PomanderMaintenanceKind.Sight or DeepDungeonPolicy.PomanderMaintenanceKind.Serenity or DeepDungeonPolicy.PomanderMaintenanceKind.Fortune or DeepDungeonPolicy.PomanderMaintenanceKind.Intuition or DeepDungeonPolicy.PomanderMaintenanceKind.Affluence or DeepDungeonPolicy.PomanderMaintenanceKind.Flight,
@@ -1313,7 +1313,6 @@ public abstract partial class AutoClear : ZoneModule
             validSlot,
             state.Count,
             state.Usable,
-            Palace.Party.Count(member => member.EntityId > 0) <= 1,
             player.FindStatus(SID.ItemPenalty) != null,
             _config.AutoPoms[(int)p],
             requiresPox,
@@ -1712,6 +1711,7 @@ public abstract partial class AutoClear : ZoneModule
             DesiredRoom.Reason != PathfindReason.Nothing, manualNavigation, player.InCombat, player.CastInfo != null, inInteractionRange))
             return;
 
+        hints.DeepDungeonDiagnosticRequest ??= $"treasure-oscillation actor={actorID},noProgress={noProgressFor.TotalSeconds:F0}s,checkpoint=before-oscillation-recovery";
         _deferredTreasureAt[actorID] = now;
         MostInterestingObject = InterestingObjects.FirstOrNull(o => o.Actor.InstanceID != actorID
             && DeepDungeonPolicy.ShouldConsiderActorForNavigation(o.Type == GoalType.Passage, PassageActorGoalAllowed));
@@ -1757,15 +1757,27 @@ public abstract partial class AutoClear : ZoneModule
         {
             progress.BestDistance = distance;
             progress.EligibleNoProgress = TimeSpan.Zero;
+            progress.DiagnosticAt10SecondsRequested = false;
+            progress.DiagnosticBeforeDeferralRequested = false;
             return;
         }
 
         // Do not charge unselected gaps; cap scheduler gaps while continuously selected.
         progress.EligibleNoProgress += TimeSpan.FromMilliseconds(Math.Min(sampleElapsed.TotalMilliseconds, 1000));
+        if (!progress.DiagnosticAt10SecondsRequested && progress.EligibleNoProgress >= DeepDungeonPolicy.TreasureStallDiagnosticThreshold)
+        {
+            hints.DeepDungeonDiagnosticRequest = $"treasure-stall actor={actorID},eligibleNoProgress={progress.EligibleNoProgress.TotalSeconds:F0}s,checkpoint=10s";
+            progress.DiagnosticAt10SecondsRequested = true;
+        }
         if (!DeepDungeonPolicy.ShouldDeferStalledTreasure(progress.EligibleNoProgress, true, manualNavigation,
             player.InCombat, player.CastInfo != null, interactionHeld))
             return;
 
+        if (!progress.DiagnosticBeforeDeferralRequested)
+        {
+            hints.DeepDungeonDiagnosticRequest = $"treasure-stall actor={actorID},eligibleNoProgress={progress.EligibleNoProgress.TotalSeconds:F0}s,checkpoint=before-deferral";
+            progress.DiagnosticBeforeDeferralRequested = true;
+        }
         _deferredTreasureAt[actorID] = now;
         MostInterestingObject = InterestingObjects.FirstOrNull(o => o.Actor.InstanceID != actorID
             && DeepDungeonPolicy.ShouldConsiderActorForNavigation(o.Type == GoalType.Passage, PassageActorGoalAllowed));

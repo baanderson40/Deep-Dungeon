@@ -7,6 +7,62 @@ namespace BossMod.Tests;
 public class ThetaStarTests
 {
     [Theory]
+    [InlineData(0.005f, true, true)]
+    [InlineData(0.05f, true, false)]
+    [InlineData(0.05f, false, true)]
+    [InlineData(0.11f, false, false)]
+    public void IntermediateWaypointUsesSmallerArrivalDeadzone(float distance, bool hasNextWaypoint, bool expected)
+        => Assert.Equal(expected, NavigationDecision.ReachedDestination(distance * distance, hasNextWaypoint));
+
+    [Fact]
+    public void SingleSegmentPathHasNoNextWaypointAndUsesFinalArrivalRadius()
+    {
+        var map = new Map(0.5f, default, 5, 5);
+        var start = map.GridToIndex(10, 10);
+        var goal = map.GridToIndex(15, 10);
+        var pathfinder = new ThetaStar();
+        pathfinder.Start(map, map.GridToWorld(10, 10, 0.5f, 0.5f), 1);
+        pathfinder.NodeByIndex(goal) = new ThetaStar.Node { GScore = 1, ParentIndex = start };
+
+        var (destination, nextWaypoint) = NavigationDecision.GetFirstWaypoints(pathfinder, goal);
+        var decision = new NavigationDecision { Destination = destination, PathfindDestination = destination, NextWaypoint = nextWaypoint };
+
+        Assert.NotNull(destination);
+        Assert.Null(nextWaypoint);
+        Assert.False(decision.HasIntermediateWaypoint);
+        Assert.Equal(0.1f, NavigationDecision.DestinationArrivalRadius(decision.HasIntermediateWaypoint));
+    }
+
+    [Fact]
+    public void DiagnosticGridPositionUsesCapturedPathfindMapTransform()
+    {
+        var map = new Map(0.5f, new(12, -7), 5, 5, 23.Degrees());
+        var decision = new NavigationDecision
+        {
+            PathfindMapCenter = map.Center,
+            PathfindMapLocalZDivRes = map.LocalZDivRes,
+            PathfindMapWidth = map.Width,
+            PathfindMapHeight = map.Height,
+        };
+
+        var world = map.GridToWorld(4, 13, 0.5f, 0.5f);
+        Assert.Equal((4, 13), decision.GridPosition(world));
+    }
+
+    [Fact]
+    public void AdjustedCombatDestinationDoesNotInheritPathWaypointArrivalMode()
+    {
+        var decision = new NavigationDecision
+        {
+            Destination = new WPos(1, 0),
+            PathfindDestination = new WPos(2, 0),
+            NextWaypoint = new WPos(3, 0),
+        };
+
+        Assert.False(decision.HasIntermediateWaypoint);
+    }
+
+    [Theory]
     [InlineData(10, 10, 0.01f, 11, 10, 15, 10)]
     [InlineData(9, 10, 0, 10, 10, 15, 10)]
     public void SameSafetyClassPrefersHigherGoalPriorityAcrossStartCellChanges(int startX, int startY, float startPriority, int nearX, int nearY, int highX, int highY)
@@ -106,6 +162,8 @@ public class ThetaStarTests
         var waypoints = NavigationDecision.GetFirstWaypoints(pathfinder, nextIndex);
         Assert.Equal(pathfinder.NodePosition(firstIndex), waypoints.first);
         Assert.Equal(pathfinder.NodePosition(nextIndex), waypoints.second);
+        var decision = new NavigationDecision { Destination = waypoints.first, PathfindDestination = waypoints.first, NextWaypoint = waypoints.second };
+        Assert.True(decision.HasIntermediateWaypoint);
 
         var validatedEndpoint = pathfinder.NodePosition(firstIndex);
         var substitutedCellCenter = pathfinder.CellCenter(firstIndex);

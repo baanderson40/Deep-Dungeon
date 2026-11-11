@@ -30,13 +30,63 @@ public class DeepDungeonPolicyTests
     }
 
     [Theory]
-    [InlineData(true, true, true, false, true)]
-    [InlineData(true, false, true, false, false)]
-    [InlineData(true, true, false, false, false)]
-    [InlineData(true, true, true, true, false)]
-    [InlineData(false, true, true, false, false)]
-    public void BossDepartureRequestRequiresCompletionSourceAndReadyPlayer(bool defeated, bool sourceTerritory, bool ready, bool transitioning, bool expected)
-        => Assert.Equal(expected, DeepDungeonPolicy.ShouldRequestDeepDungeonLeave(defeated, sourceTerritory, ready, transitioning));
+    [InlineData(true, true, true, false, true, true)]
+    [InlineData(true, false, true, false, true, false)]
+    [InlineData(true, true, false, false, true, false)]
+    [InlineData(true, true, true, true, true, false)]
+    [InlineData(true, true, true, false, false, false)]
+    [InlineData(false, true, true, false, true, false)]
+    public void BossDepartureRequestWaitsForCompletionSourceReadyPlayerAndScreen(bool defeated, bool sourceTerritory, bool ready, bool transitioning, bool screenReady, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.ShouldRequestDeepDungeonLeave(defeated, sourceTerritory, ready, transitioning, screenReady));
+
+    [Theory]
+    [InlineData(true, false, true)]
+    [InlineData(false, false, false)]
+    [InlineData(true, true, false)]
+    public void WaitingRoomExitSearchWaitsForReadyPostFadeScreen(bool screenReady, bool transitioning, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.CanSearchWaitingRoomExit(screenReady, transitioning));
+
+    [Fact]
+    public void WaitingRoomExitDiscoveryPollsAtIntervalUntilThirtySecondDeadline()
+    {
+        var start = DateTime.UnixEpoch;
+        var deadline = start + DeepDungeonPolicy.WaitingRoomExitDiscoveryTimeout;
+
+        Assert.True(DeepDungeonPolicy.ShouldPollWaitingRoomExit(true, false, start, deadline, start));
+        Assert.False(DeepDungeonPolicy.ShouldPollWaitingRoomExit(false, false, start, deadline, start));
+        Assert.False(DeepDungeonPolicy.ShouldPollWaitingRoomExit(true, true, start, deadline, start));
+        Assert.False(DeepDungeonPolicy.ShouldPollWaitingRoomExit(true, false, start, deadline, start + TimeSpan.FromMilliseconds(250)));
+        Assert.True(DeepDungeonPolicy.ShouldPollWaitingRoomExit(true, false, start + TimeSpan.FromMilliseconds(250), deadline, start + TimeSpan.FromMilliseconds(250)));
+        Assert.False(DeepDungeonPolicy.ShouldPollWaitingRoomExit(true, false, deadline, deadline, deadline));
+    }
+
+    [Fact]
+    public void WaitingRoomExitDiscoveryTimesOutAfterThirtySeconds()
+    {
+        var start = DateTime.UnixEpoch;
+
+        Assert.False(DeepDungeonPolicy.WaitingRoomExitDiscoveryExpired(start, start + TimeSpan.FromSeconds(29.9)));
+        Assert.True(DeepDungeonPolicy.WaitingRoomExitDiscoveryExpired(start, start + TimeSpan.FromSeconds(30)));
+        Assert.False(DeepDungeonPolicy.WaitingRoomExitDiscoveryExpired(default, start + TimeSpan.FromMinutes(1)));
+    }
+
+    [Theory]
+    [InlineData(true, 3.0, 13, 0.10f, 1.00f, 0.95f, true)]
+    [InlineData(false, 3.0, 13, 0.10f, 1.00f, 0.95f, false)]
+    [InlineData(true, 2.9, 13, 0.10f, 1.00f, 0.95f, false)]
+    [InlineData(true, 3.0, 7, 0.10f, 1.00f, 0.95f, false)]
+    [InlineData(true, 3.0, 13, 0.30f, 1.00f, 0.95f, false)]
+    [InlineData(true, 3.0, 13, 0.10f, 0.79f, 0.95f, false)]
+    [InlineData(true, 3.0, 13, 0.10f, 1.00f, 0.69f, false)]
+    public void MovementCollisionRecoveryRequiresSustainedCoherentCommandWithoutDisplacement(bool eligible, double span, int samples,
+        float traveled, float commandRatio, float coherence, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.ShouldRecoverFromMovementCollision(eligible, TimeSpan.FromSeconds(span), samples, traveled, commandRatio, coherence));
+
+    [Theory]
+    [InlineData(1.75f, 0.5f, 0.75f, 0.5f, true)]
+    [InlineData(1.74f, 0.5f, 0.75f, 0.5f, false)]
+    public void CollisionRecoveryObstacleMustLeavePlayerClearance(float distance, float playerRadius, float obstacleRadius, float clearance, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.IsMovementCollisionObstacleClearOfPlayer(distance, playerRadius, obstacleRadius, clearance));
 
     [Theory]
     [InlineData(1, 570, 2006016, true, 1, true)]
@@ -50,6 +100,23 @@ public class DeepDungeonPolicyTests
         => Assert.Equal(expected, DeepDungeonPolicy.IsVerifiedWaitingRoomExit((DeepDungeonState.DungeonType)dungeon, territory, baseID, targetable, candidates));
 
     [Theory]
+    [InlineData(1, 570, 2006016, true, true)]
+    [InlineData(2, 780, 2009523, true, true)]
+    [InlineData(2, 780, 2009523, false, false)]
+    [InlineData(2, 780, 2006016, true, false)]
+    [InlineData(1, 780, 2009523, true, false)]
+    public void WaitingRoomExitObjectMustMatchDungeonTerritoryAndBeTargetable(int dungeon, ushort territory, uint baseID, bool targetable, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.IsWaitingRoomExitObjectValid((DeepDungeonState.DungeonType)dungeon, territory, baseID, targetable));
+
+    [Theory]
+    [InlineData(5, 7.1f, true)]
+    [InlineData(5, 6.99f, false)]
+    [InlineData(5, 4, false)]
+    [InlineData(float.NaN, 10, false)]
+    public void DuplicateWaitingRoomExitsNeedClearNearestCandidate(float nearest, float secondNearest, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.IsUnambiguousNearestWaitingRoomExit(nearest, secondNearest));
+
+    [Theory]
     [InlineData(true, false, false, true, true, true)]
     [InlineData(false, false, false, true, true, false)]
     [InlineData(true, true, false, true, true, false)]
@@ -58,6 +125,18 @@ public class DeepDungeonPolicyTests
     [InlineData(true, false, false, true, false, false)]
     public void DepartureVnavStartsOnlyWhenReadyAndUnowned(bool ready, bool pathRunning, bool pathfinding, bool validExit, bool validPlayer, bool expected)
         => Assert.Equal(expected, DeepDungeonPolicy.ShouldStartDeparturePath(ready, pathRunning, pathfinding, validExit, validPlayer));
+
+    [Fact]
+    public void DepartureManualInputPausesOwnedApproachAndRequiresQuietWindowBeforeResume()
+    {
+        var now = new DateTime(2026, 11, 10, 12, 0, 0, DateTimeKind.Utc);
+        var resumeAt = now + TimeSpan.FromMilliseconds(750);
+
+        Assert.True(DeepDungeonPolicy.ShouldPauseDepartureForManualInput(true, now, resumeAt));
+        Assert.True(DeepDungeonPolicy.ShouldPauseDepartureForManualInput(false, now + TimeSpan.FromMilliseconds(749), resumeAt));
+        Assert.False(DeepDungeonPolicy.ShouldPauseDepartureForManualInput(false, resumeAt, resumeAt));
+        Assert.False(DeepDungeonPolicy.ShouldPauseDepartureForManualInput(false, now, default));
+    }
 
     [Theory]
     [InlineData(true, 2, 0.5f, 1.5f, true)]
@@ -283,14 +362,13 @@ public class DeepDungeonPolicyTests
         AssertAutoPomRejected(validSlot: false, reason: "slot unavailable");
         AssertAutoPomRejected(stock: 0, reason: "no stock");
         AssertAutoPomRejected(usable: false, reason: "unusable");
-        AssertAutoPomRejected(solo: false, reason: "not solo");
         AssertAutoPomRejected(itemPenalty: true, reason: "Item Penalty");
         AssertAutoPomRejected(enabledByConfig: false, reason: "configuration");
         AssertAutoPomRejected(requiresPox: true, hasPox: false, reason: "Pox");
 
-        Assert.True(DeepDungeonPolicy.CanAutoUsePomander(true, true, 1, true, true, false, true, false, false, out var eligibleReason));
+        Assert.True(DeepDungeonPolicy.CanAutoUsePomander(true, true, 1, true, false, true, false, false, out var eligibleReason));
         Assert.Equal("eligible", eligibleReason);
-        Assert.True(DeepDungeonPolicy.CanAutoUsePomander(true, true, 1, true, true, false, true, true, true, out _));
+        Assert.True(DeepDungeonPolicy.CanAutoUsePomander(true, true, 1, true, false, true, true, true, out _));
     }
 
     [Theory]
@@ -329,7 +407,7 @@ public class DeepDungeonPolicyTests
     [InlineData(false, true, 1, true, "eligible")] // Raising and Safety can use last charge on normal floors
     public void PomanderMaintenanceAppliesPerItemChargeReserve(bool bossFloor, bool allowLastCharge, byte stock, bool expected, string expectedReason)
     {
-        var eligible = DeepDungeonPolicy.CanMaintainPomander(true, true, true, true, true, false, true, stock, true,
+        var eligible = DeepDungeonPolicy.CanMaintainPomander(true, true, true, true, false, true, stock, true,
             bossFloor, allowLastCharge, false, false, false, false, false, out var reason);
         Assert.Equal(expected, eligible);
         Assert.Equal(expectedReason, reason);
@@ -350,7 +428,6 @@ public class DeepDungeonPolicyTests
         AssertMaintenanceRejected(autoDD: false, reason: "AutoDD disabled");
         AssertMaintenanceRejected(floorReady: false, reason: "floor not initialized");
         AssertMaintenanceRejected(alive: false, reason: "player dead");
-        AssertMaintenanceRejected(solo: false, reason: "not solo");
         AssertMaintenanceRejected(itemPenalty: true, reason: "Item Penalty");
         AssertMaintenanceRejected(validSlot: false, reason: "slot unavailable");
         AssertMaintenanceRejected(usable: false, reason: "unusable");
@@ -596,12 +673,12 @@ public class DeepDungeonPolicyTests
     }
 
     private static void AssertMaintenanceRejected(
-        bool maintenance = true, bool autoDD = true, bool floorReady = true, bool alive = true, bool solo = true,
+        bool maintenance = true, bool autoDD = true, bool floorReady = true, bool alive = true,
         bool itemPenalty = false, bool validSlot = true, byte stock = 2, bool usable = true, bool bossFloor = false,
         bool allowLastCharge = false, bool skipBossFloor = false, bool usedThisFloor = false,
         bool effectActive = false, bool pending = false, bool unknown = false, string reason = "")
     {
-        Assert.False(DeepDungeonPolicy.CanMaintainPomander(maintenance, autoDD, floorReady, alive, solo, itemPenalty,
+        Assert.False(DeepDungeonPolicy.CanMaintainPomander(maintenance, autoDD, floorReady, alive, itemPenalty,
             validSlot, stock, usable, bossFloor, allowLastCharge, skipBossFloor, usedThisFloor,
             effectActive, pending, unknown, out var actualReason));
         Assert.Equal(reason, actualReason);
@@ -829,17 +906,16 @@ public class DeepDungeonPolicyTests
         => Assert.Equal(expected, DeepDungeonPolicy.WasPomanderAvailableAtFloorEntry(snapshotReady, entryCount));
 
     [Theory]
-    [InlineData(true, false, 3, 4, true, 1, true, true, false, false, false)]
-    [InlineData(true, false, 4, 4, true, 1, true, true, false, false, true)]
-    [InlineData(true, false, 5, 4, true, 1, true, true, false, true, false)]
-    [InlineData(true, true, 5, 4, true, 1, true, true, false, false, false)]
-    [InlineData(false, false, 5, 4, true, 1, true, true, false, false, false)]
-    [InlineData(true, false, 5, 4, false, 0, false, true, false, false, false)]
-    [InlineData(true, false, 5, 4, true, 1, true, false, false, false, false)]
-    [InlineData(true, false, 5, 4, true, 1, true, true, true, false, false)]
+    [InlineData(true, false, 3, 4, true, 1, true, false, false, false)]
+    [InlineData(true, false, 4, 4, true, 1, true, false, false, true)]
+    [InlineData(true, true, 5, 4, true, 1, true, false, false, false)]
+    [InlineData(false, false, 5, 4, true, 1, true, false, false, false)]
+    [InlineData(true, false, 5, 4, false, 0, false, false, false, false)]
+    [InlineData(true, false, 5, 4, true, 1, true, true, false, false)]
+    [InlineData(true, false, 5, 4, true, 1, true, false, true, false)]
     public void AutoWitchingRequiresConfiguredThresholdAndAllSafetyGates(bool enabled, bool bossFloor, int aggroCount, int threshold,
-        bool validSlot, int stock, bool usable, bool solo, bool itemPenalty, bool alreadyHandled, bool expected)
-        => Assert.Equal(expected, DeepDungeonPolicy.ShouldAutoUseWitching(enabled, bossFloor, aggroCount, threshold, validSlot, stock, usable, solo, itemPenalty, alreadyHandled));
+        bool validSlot, int stock, bool usable, bool itemPenalty, bool alreadyHandled, bool expected)
+        => Assert.Equal(expected, DeepDungeonPolicy.ShouldAutoUseWitching(enabled, bossFloor, aggroCount, threshold, validSlot, stock, usable, itemPenalty, alreadyHandled));
 
     [Fact]
     public void TreasureProgressGoalRewardsCloserPositionsAndNotDistantInteractionAttraction()
@@ -1232,14 +1308,13 @@ public class DeepDungeonPolicyTests
         bool validSlot = true,
         byte stock = 1,
         bool usable = true,
-        bool solo = true,
         bool itemPenalty = false,
         bool enabledByConfig = true,
         bool requiresPox = false,
         bool hasPox = false,
         string reason = "")
     {
-        Assert.False(DeepDungeonPolicy.CanAutoUsePomander(validDungeon, validSlot, stock, usable, solo, itemPenalty, enabledByConfig, requiresPox, hasPox, out var actualReason));
+        Assert.False(DeepDungeonPolicy.CanAutoUsePomander(validDungeon, validSlot, stock, usable, itemPenalty, enabledByConfig, requiresPox, hasPox, out var actualReason));
         Assert.Contains(reason, actualReason, StringComparison.OrdinalIgnoreCase);
     }
 }

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Dalamud.Game.ClientState.Objects.Types;
 
 namespace BossMod;
 
@@ -128,6 +129,8 @@ public sealed class AIHints
 
     // indicates to AI mode that it should try to interact with some object
     public Actor? InteractWithTarget;
+    // Direct object-table fallback for synchronized objects that have no usable network entity ID.
+    public IGameObject? InteractWithRawTarget;
 
     // positioning: list of shapes that are either forbidden to stand in now or will be in near future
     // AI will try to move in such a way to avoid standing in any forbidden zone after its activation or outside of some restricted zone after its activation, even at the cost of uptime
@@ -230,6 +233,7 @@ public sealed class AIHints
         ForcedMovement = null;
         SpinDirection = null;
         InteractWithTarget = null;
+        InteractWithRawTarget = null;
         ForbiddenZones.Clear();
         GoalZones.Clear();
         GoalZoneOwners.Clear();
