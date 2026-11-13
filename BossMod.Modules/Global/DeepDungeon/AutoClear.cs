@@ -49,6 +49,12 @@ public abstract partial class AutoClear : ZoneModule
     }
 
     public readonly int LevelCap;
+    private readonly DeepDungeonTreasureSelection _treasureSelection = new();
+    private DeepDungeonPolicy.PassageSelection _passageSelection;
+    private string TreasureSelectionContext => $"{Palace.DungeonId}/{Palace.Floor}/{World.CurrentZone}";
+    private string? PotentialTrapObjectiveKey => MostInterestingObject is { } goal
+        ? $"{TreasureSelectionContext}/actor:{goal.Type}:{goal.Actor.InstanceID}"
+        : RoomRejoinContext is { } room ? $"{room}/room-route" : null;
 
     public static readonly HashSet<uint> BronzeChestIDs = [
         // PotD
@@ -317,8 +323,8 @@ public abstract partial class AutoClear : ZoneModule
         var passageRooms = string.Join(",", World.Actors
             .Where(a => Palace.PassageActive && !player.InCombat && (a.OID == (uint)OID.CairnPalace || a.OID == (uint)OID.BeaconHoH || a.OID == (uint)OID.PylonEO || a.OID == (uint)OID.PylonPT))
             .Take(6)
-            .Select(a => $"{a.InstanceID}:room:{(TryFindClosestRoom(a.Position, out var passageRoom) ? passageRoom.Index.ToString() : "?")}/near:{IsInThisRoomOrAdjacent(a)}/goalAllowed:{PassageActorGoalAllowed}"));
-        Service.Log($"[AutoDD] actor navigation selection changed: selected={chosen}, changesSinceLastLog={_pendingActorGoalSelectionChanges}, transitions=[{transitions}{(_otherActorSelectionTransitions > 0 ? $",other:{_otherActorSelectionTransitions}" : "")}], lastTransitionContext={_lastActorSelectionContext}, rule=goal type then distance among movement-eligible actors, playerRoom={PlayerRoom}, playerXZ=({player.Position.X:F1},{player.Position.Z:F1}),inCombat={player.InCombat}, passageActive={Palace.PassageActive}, passageActorGoalAllowed={PassageActorGoalAllowed}, candidates=[{candidates}],passageRooms=[{passageRooms}].");
+            .Select(a => $"{a.InstanceID}:room:{(TryFindClosestRoom(a.Position, out var passageRoom) ? passageRoom.Index.ToString() : "?")}/near:{IsInThisRoomOrAdjacent(a)}/retained:{_passageSelection.CanRetain(TreasureSelectionContext, a.InstanceID)}/goalAllowed:{PassageActorGoalAllowed}"));
+        Service.Log($"[AutoDD] actor navigation selection changed: selected={chosen}, changesSinceLastLog={_pendingActorGoalSelectionChanges}, transitions=[{transitions}{(_otherActorSelectionTransitions > 0 ? $",other:{_otherActorSelectionTransitions}" : "")}], lastTransitionContext={_lastActorSelectionContext}, rule=goal type then retained treasure then distance among movement-eligible actors, playerRoom={PlayerRoom}, playerXZ=({player.Position.X:F1},{player.Position.Z:F1}),inCombat={player.InCombat}, passageActive={Palace.PassageActive}, passageActorGoalAllowed={PassageActorGoalAllowed}, candidates=[{candidates}],passageRooms=[{passageRooms}].");
         _lastActorGoalSelectionLogAt = now;
         _pendingActorGoalSelectionChanges = 0;
         _actorSelectionTransitions.Clear();
@@ -459,6 +465,7 @@ public abstract partial class AutoClear : ZoneModule
 
     private void ResetFloorScopedNavigationRecovery()
     {
+        _passageSelection = default;
         _floorStartPomanderWindowAt = default;
         _autoWitchingPullHandled = false;
         _deferredTreasureAt.Clear();
@@ -1233,6 +1240,7 @@ public abstract partial class AutoClear : ZoneModule
         Walls.Clear();
         ClearDesiredRoom("floor state reset");
         ResetObjectiveProgress("floor state reset");
+        _passageSelection = default;
         Kills = 0;
         Array.Fill(_playerImmunes, default);
         _chestContentsGold.Clear();
@@ -1421,18 +1429,32 @@ public abstract partial class AutoClear : ZoneModule
 
     public override void CalculateAIHints(int playerSlot, Actor player, AIHints hints)
     {
+        if (!_config.Enable || player.IsDead || DesiredRoom.Reason == PathfindReason.Manual
+            || DeepDungeonPartyPolicy.RecentManualMovement(hints.DeepDungeonCoordinationManualAt, World.CurrentTime))
+            _treasureSelection.Reset();
         LogEnableState();
         TryInitializeFloor("AI hint update");
+        if (!_config.Enable || player.IsDead || !Palace.PassageActive || !PassageActorGoalAllowed
+            || _passageSelection.ActorId != 0 && (World.Actors.Find(_passageSelection.ActorId) is not { IsDestroyed: false }
+                || _fakeExits.Contains(_passageSelection.ActorId)))
+            _passageSelection = default;
         ExpirePomanderReadbacks();
         ReconcilePomanderMaintenance(player);
+        hints.DeepDungeonRoleActive = _config.Enable;
+        hints.DeepDungeonPartyMode = _config.Enable && (_config.Role == AutoDDConfig.PartyRole.Follower
+            || World.Party.Members.Take(PartyState.MaxPartySize).Count(m => m.IsValid()) > 1);
         if (!_config.Enable)
         {
+            _partyRegroup.Reset();
+            _partyContext = default;
+            ResetRoomRejoin();
             MostInterestingObject = null;
             InterestingObjects.Clear();
         }
 
         if (!DeepDungeonPolicy.IsFloorContextReady((int)Palace.DungeonId, Palace.Floor))
         {
+            _roomRejoin.Pause(Environment.TickCount64);
             LogAutoDDBlocker("waiting for deep dungeon state initialization");
             ResetObjectiveProgress("waiting for deep dungeon state initialization");
             return;
@@ -1440,6 +1462,7 @@ public abstract partial class AutoClear : ZoneModule
 
         if (World.DeepDungeon.BossCompletionObserved)
         {
+            ResetRoomRejoin();
             MostInterestingObject = null;
             InterestingObjects.Clear();
             ClearDesiredRoom("boss completion observed; awaiting departure");
@@ -1449,6 +1472,7 @@ public abstract partial class AutoClear : ZoneModule
 
         if (player.IsDead)
         {
+            _roomRejoin.Pause(Environment.TickCount64);
             MostInterestingObject = null;
             InterestingObjects.Clear();
             LogAutoDDBlocker("player dead");
@@ -1456,11 +1480,10 @@ public abstract partial class AutoClear : ZoneModule
             return;
         }
 
-        if (Palace.IsBossFloor || BetweenFloors)
+        if (BetweenFloors && !Palace.IsBossFloor)
         {
-            if (Palace.IsBossFloor && !BetweenFloors)
-                TryQueuePomanderMaintenance(player, hints, bossFloor: true, departureIntent: Palace.PassageActive && !player.InCombat);
-            var blocker = Palace.IsBossFloor ? "boss floor" : "between floors / map not initialized";
+            _roomRejoin.Pause(Environment.TickCount64);
+            var blocker = "between floors / map not initialized";
             LogAutoDDBlocker(blocker);
             ResetObjectiveProgress(blocker);
             return;
@@ -1476,10 +1499,34 @@ public abstract partial class AutoClear : ZoneModule
         {
             var tshape = _trapsCurrentFloor.Select(t => new WPos(t.X, t.Z)).Where(f => f.AlmostEqual(player.Position, 30)).Select(f => ShapeDistance.Circle(f, TrapRadius)).ToList();
             if (tshape.Count > 0)
-                hints.AddForbiddenZone(ShapeDistance.Union(tshape));
+            {
+                var potentialTraps = ShapeDistance.Union(tshape);
+                hints.DeepDungeonPotentialTrapDistance = potentialTraps;
+                hints.AddForbiddenZone(potentialTraps, source: AIHints.DeepDungeonPotentialTrapTag);
+            }
         }
 
         DrawAOEs(playerSlot, player, hints);
+
+        // Revealed traps are safety data, not leader-only object selection.
+        foreach (var actor in World.Actors)
+            if (RevealedTrapOIDs.Contains(actor.OID))
+                hints.AddForbiddenZone(ShapeDistance.Circle(actor.Position, TrapRadius));
+
+        if (CalculatePartyHints(player, hints))
+        {
+            _roomRejoin.Pause(Environment.TickCount64);
+            return;
+        }
+
+        if (Palace.IsBossFloor)
+        {
+            ResetRoomRejoin();
+            if (!BetweenFloors)
+                TryQueuePomanderMaintenance(player, hints, bossFloor: true, departureIntent: Palace.PassageActive && !player.InCombat);
+            ResetObjectiveProgress("boss floor");
+            return;
+        }
 
         if (_config.ForbidDOTs)
             foreach (var hpt in hints.PotentialTargets)
@@ -1495,18 +1542,17 @@ public abstract partial class AutoClear : ZoneModule
 
         if (!geometryReady)
         {
+            _roomRejoin.Pause(Environment.TickCount64);
             MostInterestingObject = null;
             TryQueuePomanderMaintenance(player, hints, bossFloor: false);
             LogAutoDDBlocker($"room geometry unavailable: {geometryReason}");
-            foreach (var actor in World.Actors)
-                if (RevealedTrapOIDs.Contains(actor.OID))
-                    hints.AddForbiddenZone(ShapeDistance.Circle(actor.Position, TrapRadius));
             ResetObjectiveProgress("room geometry unavailable");
             return;
         }
 
         if (!TryFindClosestRoom(player.Position, out var playerRoom))
         {
+            _roomRejoin.Pause(Environment.TickCount64);
             TryQueuePomanderMaintenance(player, hints, bossFloor: false);
             LogAutoDDBlocker("player room could not be resolved from current geometry");
             ResetObjectiveProgress("player room unavailable");
@@ -1522,11 +1568,14 @@ public abstract partial class AutoClear : ZoneModule
         if (!roomNavigationEnabled && DesiredRoom.Reason != PathfindReason.Nothing)
             ClearDesiredRoom("automatic navigation disabled");
 
-        if (canNavigate && roomNavigationEnabled)
-            HandleFloorPathfind(player, hints);
-
-        if (!_config.Enable)
+        _roomRejoinOwnsFrame = false;
+        if (!_config.Enable || manualNavigation)
         {
+            ResetRoomRejoin();
+            MostInterestingObject = null;
+            InterestingObjects.Clear();
+            if (canNavigate && roomNavigationEnabled)
+                HandleFloorPathfind(player, hints, DeepDungeonRoomRejoinPolicy.NavigationOwner.Manual);
             // HandleFloorPathfind may have completed and cleared a manual destination this frame.
             manualNavigation = DesiredRoom.Reason == PathfindReason.Manual;
             if (manualNavigation)
@@ -1536,9 +1585,11 @@ public abstract partial class AutoClear : ZoneModule
             }
             else
             {
-                LogAutoDDBlocker("AutoDD disabled (manual minimap destination only)");
-                ResetObjectiveProgress("AutoDD disabled");
+                LogAutoDDBlocker(_config.Enable ? null : "AutoDD disabled (manual minimap destination only)");
+                ResetObjectiveProgress(_config.Enable ? "manual destination reached" : "AutoDD disabled");
             }
+            if (_config.Enable)
+                TryQueuePomanderMaintenance(player, hints, bossFloor: false);
             return;
         }
 
@@ -1571,19 +1622,25 @@ public abstract partial class AutoClear : ZoneModule
             var dist = (player.Position - a.Position).LengthSq();
 
             var oid = (OID)a.OID;
-            if (IsInThisRoomOrAdjacent(a))
+            var adjacent = IsInThisRoomOrAdjacent(a);
+            var retainedTreasure = MostInterestingObject is { IsTreasure: true } previous && previous.Actor.InstanceID == a.InstanceID
+                && _treasureSelection.CanRetain(TreasureSelectionContext, a.InstanceID);
+            var passageCandidate = oid is OID.CairnPalace or OID.BeaconHoH or OID.PylonEO or OID.PylonPT
+                && _passageSelection.CanAdmit(TreasureSelectionContext, a.InstanceID, adjacent,
+                    !a.IsDestroyed && Palace.PassageActive && !player.InCombat);
+            if (adjacent || retainedTreasure || passageCandidate)
             {
                 if (!isTransformed)
                 {
-                    if (oid == OID.BandedCoffer && a.IsTargetable)
+                    if (oid == OID.BandedCoffer && a.IsTargetable && !a.IsOpenTreasure)
                         InterestingObjects.Add(new(a, GoalType.ChestHoard, dist));
 
                     if (_config.OpenTreasure)
                     {
-                        if (oid == OID.GoldCoffer && a.IsTargetable)
+                        if (oid == OID.GoldCoffer && a.IsTargetable && !a.IsOpenTreasure)
                             InterestingObjects.Add(new(a, GoalType.Treasure, dist, 3));
 
-                        if (oid == OID.SilverCoffer && OpenSilver && a.IsTargetable)
+                        if (oid == OID.SilverCoffer && OpenSilver && a.IsTargetable && !a.IsOpenTreasure)
                             InterestingObjects.Add(new(a, GoalType.Treasure, dist, 2));
 
                         if (BronzeChestIDs.Contains(a.OID) && DeepDungeonPolicy.ShouldConsiderBronzeTreasure(a.IsTargetable, a.IsOpenTreasure))
@@ -1591,15 +1648,13 @@ public abstract partial class AutoClear : ZoneModule
                     }
                 }
 
-                if (oid == OID.BandedCofferIndicator && Palace.Progress.HoardCurrentFloor)
+                if (adjacent && oid == OID.BandedCofferIndicator && Palace.Progress.HoardCurrentFloor)
                     InterestingObjects.Add(new(a, GoalType.Hoard, dist));
 
-                if (oid is OID.CairnPalace or OID.BeaconHoH or OID.PylonEO or OID.PylonPT && Palace.PassageActive && !player.InCombat)
+                if (passageCandidate)
                     InterestingObjects.Add(new(a, GoalType.Passage, dist));
             }
 
-            if (RevealedTrapOIDs.Contains(a.OID))
-                hints.AddForbiddenZone(ShapeDistance.Circle(a.Position, TrapRadius));
         }
 
         PickARoom(player, hints);
@@ -1611,25 +1666,94 @@ public abstract partial class AutoClear : ZoneModule
         InterestingObjects.RemoveAll(o => o.Type == GoalType.Treasure
             && _deferredTreasureAt.TryGetValue(o.Actor.InstanceID, out var deferredAt) && DeepDungeonPolicy.IsTreasureDeferred(deferredAt, now));
 
-        InterestingObjects.SortBy(o => (o.Type, o.PlayerDistSq));
+        InterestingObjects.SortBy(o => (o.Type, o.IsTreasure && _treasureSelection.CanRetain(TreasureSelectionContext, o.Actor.InstanceID) ? 0 : 1, o.PlayerDistSq));
 
         MostInterestingObject = InterestingObjects.FirstOrNull(o => DeepDungeonPolicy.ShouldConsiderActorForNavigation(o.Type == GoalType.Passage, PassageActorGoalAllowed));
         UpdateTreasureStallRecovery(player, hints, canNavigate, manualNavigation);
         UpdateTreasureOscillationRecovery(player, hints, canNavigate, manualNavigation);
+        var selectedTreasure = MostInterestingObject is { IsTreasure: true } treasure ? treasure.Actor : null;
+        _treasureSelection.Select(TreasureSelectionContext, selectedTreasure?.InstanceID ?? 0, World.CurrentTime,
+            selectedTreasure != null && IsInThisRoomOrAdjacent(selectedTreasure));
         LogSelectedActorGoal(player);
+
+        var selectedPassage = MostInterestingObject is { Type: GoalType.Passage, Actor: var passageActor } && PassageActorGoalAllowed ? passageActor : null;
+        _passageSelection.Select(TreasureSelectionContext, selectedPassage?.InstanceID ?? 0);
+        var localPassage = selectedPassage != null && DeepDungeonPartyPolicy.UseLocalPassageGoal(selectedPassage.InstanceID,
+            _passageAssembly.Passage, (selectedPassage.Position - player.Position).Length(), selectedPassage.PosRot.Y - player.PosRot.Y);
+
+        // Select/revalidate objectives before any room recovery can claim navigation. Actor goals
+        // own attraction exclusively; unrelated room goals must not reverse their movement.
+        var owner = DeepDungeonRoomRejoinPolicy.SelectOwner(manualNavigation,
+            MostInterestingObject != null, canNavigate,
+            hints.InteractWithTarget != null || hints.InteractWithRawTarget != null);
+        _roomRejoin.Bind(RoomRejoinContext);
+        if (_roomRejoin.Attempts == 0)
+            World.DeepDungeon.RoomRejoinStatus = null;
+        if (canNavigate && roomNavigationEnabled)
+            HandleFloorPathfind(player, hints, owner);
+        else
+            _roomRejoin.Pause(Environment.TickCount64);
+        if (_roomRejoinOwnsFrame)
+        {
+            foreach (var enemy in hints.PotentialTargets)
+            {
+                var engaged = DeepDungeonPartyPolicy.CanAssist(enemy.Actor.AggroPlayer, enemy.Actor.InCombat,
+                    World.Party.TryFindSlot(enemy.Actor.TargetID, out var partySlot) && partySlot < PartyState.MaxPartySize);
+                if (!engaged)
+                {
+                    enemy.ShouldBeTargeted = false;
+                    enemy.ForcePriority(AIHints.Enemy.PriorityForbidden);
+                }
+            }
+            hints.DeepDungeonPartyGoals = [.. hints.GoalZones];
+            hints.SetDeepDungeonPotentialTrapObjective(PotentialTrapObjectiveKey);
+            LogObjectiveProgress(player, hints, numAggro, canNavigate);
+            TryQueuePomanderMaintenance(player, hints, bossFloor: false);
+            return;
+        }
 
         LogAutoDDBlocker(canNavigate ? null : $"pull limit reached ({numAggro}/{_config.MaxPull})");
 
         var goalWeight = player.InCombat ? 1 : 0.01f;
+        var assemblyActive = _passageAssembly.Update(Environment.TickCount64, localPassage ? selectedPassage!.InstanceID : 0, Palace.PassageActive,
+            selectedPassage != null ? (selectedPassage.Position - player.Position).Length() : float.MaxValue,
+            selectedPassage != null ? selectedPassage.PosRot.Y - player.PosRot.Y : float.MaxValue,
+            localPassage, player.InCombat || player.CastInfo != null || !canNavigate);
+        var assembling = localPassage && assemblyActive;
+        if (assembling && selectedPassage != null)
+            ObservePassageAssembly(player, selectedPassage, hints, player.InCombat || player.CastInfo != null || !canNavigate);
+        if (assembling)
+            hints.DeepDungeonPartyNavigationKey = AutoNavigationKey($"passage:{_passageAssembly.Passage:X}:blocked:{_passageAssembly.Blocked}:replan:{_passageAssembly.Replans}");
+        else if (owner == DeepDungeonRoomRejoinPolicy.NavigationOwner.Actor)
+            hints.DeepDungeonPartyNavigationKey = AutoNavigationKey($"actor:{MostInterestingObject?.Type}:{MostInterestingObject?.Actor.InstanceID ?? hints.InteractWithTarget?.InstanceID ?? 0}");
+        else if (owner == DeepDungeonRoomRejoinPolicy.NavigationOwner.Suspended)
+            hints.DeepDungeonPartyNavigationKey = AutoNavigationKey("automatic-navigation-suspended");
 
         if (canNavigate)
         {
             switch (MostInterestingObject)
             {
                 case { Type: GoalType.Passage, Actor: var c } when PassageActorGoalAllowed:
-                    hints.AddGoalZone(AIHints.GoalSingleTarget(c.Position, 2, goalWeight), $"deepdungeon-passage:{c.InstanceID}:interact-range");
-                    hints.AddGoalZone(AIHints.GoalSingleTarget(c.Position, 25, goalWeight), $"deepdungeon-passage:{c.InstanceID}:approach");
-                    hints.AddGoalZone(DeepDungeonPolicy.PassageProgressGoal(c.Position, player.Position, 25, 100, 1, goalWeight), $"deepdungeon-passage:{c.InstanceID}:progress");
+                    if (!localPassage)
+                    {
+                        AddPassageApproachGoals(player, c, hints, goalWeight);
+                    }
+                    else if (_passageAssembly.Blocked)
+                    {
+                        if (!_partyHolding)
+                        {
+                            _partyHolding = true;
+                            _partyHoldAnchor = player.Position;
+                        }
+                        hints.AddGoalZone(AIHints.GoalSingleTarget(_partyHoldAnchor, 1, 1), "deepdungeon-passage-blocked-hold");
+                        hints.DeepDungeonIntentionalHoldReason = "passage assembly blocked; deadline or bounded replans exhausted; explicit retry or changed evidence required";
+                        LogPartyStatus("passage assembly blocked; deadline exhausted, move party or explicitly retry");
+                    }
+                    else
+                    {
+                        AddPassageGoals(player, c, hints, goalWeight, _passageAssembly.Replans);
+                        LogPartyStatus($"leader assembling at passage {c.InstanceID:X}; localArrival={player.Position.InCircle(c.Position, DeepDungeonPartyPolicy.PassageInnerRadius)}");
+                    }
                     break;
 
                 case { Type: GoalType.Hoard, Actor: var h }:
@@ -1659,6 +1783,14 @@ public abstract partial class AutoClear : ZoneModule
 
         foreach (var pp in hints.PotentialTargets)
         {
+            if ((selectedPassage != null || _partyRegroup.State == DeepDungeonPartyPolicy.RegroupState.Verifying)
+                && !DeepDungeonPartyPolicy.CanAssist(pp.Actor.AggroPlayer, pp.Actor.InCombat,
+                    World.Party.TryFindSlot(pp.Actor.TargetID, out var targetSlot) && targetSlot < PartyState.MaxPartySize))
+            {
+                pp.ShouldBeTargeted = false;
+                pp.ForcePriority(AIHints.Enemy.PriorityForbidden);
+                continue;
+            }
             // enemy is petrified, any damage will kill
             var petrified = pp.Actor.FindStatus(SID.StoneCurse)?.ExpireAt > World.FutureTime(1.5f);
             var stopProactivePetrificationSweep = Palace.DungeonId == DeepDungeonState.DungeonType.HOH
@@ -1677,7 +1809,7 @@ public abstract partial class AutoClear : ZoneModule
                 pp.ForcePriority(0);
 
             // if not at max pull size, prioritize mobs
-            else if (canTarget && (numAggro < _config.MaxPull || _config.MaxPull == 0 && numAggro == 0) && !pp.Actor.Statuses.Any(s => IsDangerousOutOfCombatStatus(s.ID)) && IsInThisRoomOrAdjacent(pp.Actor) && !pp.Actor.AggroPlayer)
+            else if (selectedPassage == null && _partyRegroup.State != DeepDungeonPartyPolicy.RegroupState.Verifying && canTarget && (numAggro < _config.MaxPull || _config.MaxPull == 0 && numAggro == 0) && !pp.Actor.Statuses.Any(s => IsDangerousOutOfCombatStatus(s.ID)) && IsInThisRoomOrAdjacent(pp.Actor) && !pp.Actor.AggroPlayer)
             {
                 // passive mobs shouldn't be prioritized over aggro'd ones
                 if (player.InCombat)
@@ -1687,6 +1819,16 @@ public abstract partial class AutoClear : ZoneModule
             }
         }
 
+        if (assembling || _partyRegroup.State == DeepDungeonPartyPolicy.RegroupState.Verifying)
+        {
+            hints.DeepDungeonPartyGoals = [.. hints.GoalZones];
+            if (assembling && selectedPassage != null)
+            {
+                var assemblyCenter = selectedPassage.Position;
+                hints.DeepDungeonPartyCombatArea = p => p.InCircle(assemblyCenter, DeepDungeonPartyPolicy.PassageInnerRadius);
+            }
+        }
+        hints.SetDeepDungeonPotentialTrapObjective(canNavigate ? PotentialTrapObjectiveKey : null);
         LogObjectiveProgress(player, hints, numAggro, canNavigate);
         TryQueuePomanderMaintenance(player, hints, bossFloor: false, departureIntent: Palace.PassageActive && DesiredRoom.Reason == PathfindReason.OpenPassage);
     }
@@ -1700,7 +1842,7 @@ public abstract partial class AutoClear : ZoneModule
         hints.DeepDungeonOscillatingTreasureID = 0;
         hints.DeepDungeonOscillationFloor = 0;
         hints.DeepDungeonOscillationAt = default;
-        if (!canNavigate || manualNavigation || player.InCombat || player.CastInfo != null || MostInterestingObject is not { IsTreasure: true } selected
+        if (!canNavigate || manualNavigation || hints.DeepDungeonPotentialTrapCrossingRequested || player.InCombat || player.CastInfo != null || MostInterestingObject is not { IsTreasure: true } selected
             || !DeepDungeonPolicy.IsTreasureOscillationSignalValid(actorID, selected.Actor.InstanceID, signalFloor, Palace.Floor, signalAt, World.CurrentTime))
             return;
 
@@ -1720,6 +1862,7 @@ public abstract partial class AutoClear : ZoneModule
 
     private void ResetTreasureProgress()
     {
+        _treasureSelection.Reset();
         _treasureProgress.Clear();
     }
 
@@ -1740,7 +1883,7 @@ public abstract partial class AutoClear : ZoneModule
             _treasureProgress.Add(actorID, progress);
         }
 
-        var interactionHeld = hints.InteractWithTarget != null;
+        var interactionHeld = hints.InteractWithTarget != null || hints.InteractWithRawTarget != null;
         var eligible = canNavigate && !manualNavigation && !player.InCombat && player.CastInfo == null && !interactionHeld;
         var playerMovement = progress.LastSelectedAt == default ? 0 : (player.Position - progress.LastPlayerPosition).Length();
         var sampleElapsed = DeepDungeonPolicy.TreasureSelectedSampleDuration(progress.LastSelectedAt, now, progress.LastSampleAt);
@@ -1748,12 +1891,15 @@ public abstract partial class AutoClear : ZoneModule
         progress.LastPlayerPosition = player.Position;
         if (!eligible)
         {
-            progress.LastSampleAt = now;
+            progress.LastSampleAt = default;
             return;
         }
 
         progress.LastSampleAt = now;
-        if (DeepDungeonPolicy.HasMeaningfulProgress(progress.BestDistance, distance))
+        // Deadline is checked only when navigation can act; combat/casting/interaction do not
+        // trigger recovery. Successful small improvements cannot renew this admitted objective forever.
+        var deadlineExpired = _treasureSelection.DeadlineExpired(TreasureSelectionContext, actorID, now);
+        if (!deadlineExpired && DeepDungeonPolicy.HasMeaningfulProgress(progress.BestDistance, distance))
         {
             progress.BestDistance = distance;
             progress.EligibleNoProgress = TimeSpan.Zero;
@@ -1769,19 +1915,29 @@ public abstract partial class AutoClear : ZoneModule
             hints.DeepDungeonDiagnosticRequest = $"treasure-stall actor={actorID},eligibleNoProgress={progress.EligibleNoProgress.TotalSeconds:F0}s,checkpoint=10s";
             progress.DiagnosticAt10SecondsRequested = true;
         }
-        if (!DeepDungeonPolicy.ShouldDeferStalledTreasure(progress.EligibleNoProgress, true, manualNavigation,
+        if (!deadlineExpired && !DeepDungeonPolicy.ShouldDeferStalledTreasure(progress.EligibleNoProgress, true, manualNavigation,
             player.InCombat, player.CastInfo != null, interactionHeld))
             return;
 
+        // Comparison routes are prepared without changing movement. At the normal 15s stall
+        // threshold let a fresh, validated prediction-only crossing run before abandoning the chest.
+        if (!deadlineExpired && hints.DeepDungeonPotentialTrapDistance != null
+            && DeepDungeonPotentialTrapCrossing.FreshAlternative(PotentialTrapObjectiveKey, hints.DeepDungeonPotentialTrapResult, Environment.TickCount64)
+            && (hints.DeepDungeonPotentialTrapResult.Active || progress.EligibleNoProgress < TimeSpan.FromSeconds(18)))
+        {
+            hints.DeepDungeonPotentialTrapCrossingRequested = true;
+            return;
+        }
+
         if (!progress.DiagnosticBeforeDeferralRequested)
         {
-            hints.DeepDungeonDiagnosticRequest = $"treasure-stall actor={actorID},eligibleNoProgress={progress.EligibleNoProgress.TotalSeconds:F0}s,checkpoint=before-deferral";
+            hints.DeepDungeonDiagnosticRequest = $"treasure-stall actor={actorID},eligibleNoProgress={progress.EligibleNoProgress.TotalSeconds:F0}s,objectiveDeadlineExpired={deadlineExpired},checkpoint=before-deferral";
             progress.DiagnosticBeforeDeferralRequested = true;
         }
         _deferredTreasureAt[actorID] = now;
         MostInterestingObject = InterestingObjects.FirstOrNull(o => o.Actor.InstanceID != actorID
             && DeepDungeonPolicy.ShouldConsiderActorForNavigation(o.Type == GoalType.Passage, PassageActorGoalAllowed));
-        Service.Log($"[AutoDD] treasure stall recovery: actor={actorID}, action=defer chest for {DeepDungeonPolicy.TreasureRecoveryCooldown.TotalSeconds:F0}s, eligibleNoProgress={progress.EligibleNoProgress.TotalSeconds:F0}s, distance={distance:F1}, bestDistance={progress.BestDistance:F1}, distanceImprovement={progress.BestDistance - distance:F2}, playerMovement={playerMovement:F2}y since selected sample; unselected gaps/combat/casting/manual/interaction holds excluded, hazard zones unchanged.");
+        Service.Log($"[AutoDD] treasure stall recovery: actor={actorID}, action=defer chest for {DeepDungeonPolicy.TreasureRecoveryCooldown.TotalSeconds:F0}s, eligibleNoProgress={progress.EligibleNoProgress.TotalSeconds:F0}s, objectiveDeadlineExpired={deadlineExpired}, objectiveDeadline={DeepDungeonTreasureSelection.ObjectiveDeadline.TotalSeconds:F0}s, distance={distance:F1}, bestDistance={progress.BestDistance:F1}, distanceImprovement={progress.BestDistance - distance:F2}, playerMovement={playerMovement:F2}y since selected sample; unselected gaps/combat/casting/manual/interaction holds excluded from no-progress time, hazard zones unchanged.");
         _treasureProgress.Remove(actorID);
     }
 

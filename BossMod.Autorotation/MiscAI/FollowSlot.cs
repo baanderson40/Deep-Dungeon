@@ -23,6 +23,8 @@ public sealed class FollowSlot(RotationModuleManager manager, Actor player) : Ty
 
     public override void Execute(in Strategy strategy, ref Actor? primaryTarget, float estimatedAnimLockDelay, bool isMoving)
     {
+        if (Hints.DeepDungeonPartyMode)
+            return;
         // fallback for users not using autorot (this module is meant to replace legacy ai)
         if (_aiConfig.GoalZoneFallback && Hints.GoalZones.Count == 0 && primaryTarget is { IsAlly: false })
         {

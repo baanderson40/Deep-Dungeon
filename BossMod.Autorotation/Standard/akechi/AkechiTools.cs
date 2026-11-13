@@ -529,7 +529,7 @@ public abstract class AkechiTools<AID, TraitID>(RotationModuleManager manager, A
     protected void GoalZoneSingle(float range)
     {
         if (GoalTarget != null)
-            Hints.GoalZones.Add(Hints.GoalSingleTarget(GoalTarget.Actor, Player, World.Actors, range));
+            Hints.AddGoalZone(Hints.GoalSingleTarget(GoalTarget.Actor, Player, World.Actors, range), GoalDiagnosticOwner("single-range", GoalTarget.Actor, range));
     }
     protected void GoalZoneCombined(StrategyValues strategy, float range, Func<WPos, float> fAoe, AID firstUnlockedAoeAction, int minAoe, float? maximumActionRange = null)
         => AddGoalZone(range, fAoe, firstUnlockedAoeAction, minAoe, maximumActionRange, Hints.RecommendedPositional.Pos);
@@ -542,11 +542,11 @@ public abstract class AkechiTools<AID, TraitID>(RotationModuleManager manager, A
     {
         var aoe = Unlocked(firstUnlockedAoeAction) ? minAoe : 50;
         if (GoalTarget == null && aoe < 50)
-            Hints.GoalZones.Add(fAoe);
+            Hints.AddGoalZone(fAoe, GoalDiagnosticOwner("aoe", null, range));
         if (GoalTarget != null)
-            Hints.GoalZones.Add(GoalCombined(Hints.GoalSingleTarget(GoalTarget.Actor, positional, Player, World.Actors, range), fAoe, aoe));
+            Hints.AddGoalZone(GoalCombined(Hints.GoalSingleTarget(GoalTarget.Actor, positional, Player, World.Actors, range), fAoe, aoe), GoalDiagnosticOwner($"combined/positional:{positional}", GoalTarget.Actor, range));
         if (GoalTarget != null && maximumActionRange is float r)
-            Hints.GoalZones.Add(Hints.GoalSingleTarget(GoalTarget.Actor, Player, World.Actors, r, 0.5f));
+            Hints.AddGoalZone(Hints.GoalSingleTarget(GoalTarget.Actor, Player, World.Actors, r, 0.5f), GoalDiagnosticOwner("maximum-action-range", GoalTarget.Actor, r));
     }
     #endregion
 

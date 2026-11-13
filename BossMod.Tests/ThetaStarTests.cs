@@ -6,6 +6,24 @@ namespace BossMod.Tests;
 
 public class ThetaStarTests
 {
+    [Fact]
+    public void RequestStampPreservesContextAndSequenceWithoutMixingWorldTimeWithMonotonicTime()
+    {
+        var context = "target:1/role:Leader";
+        var request = new NavigationDecision.RequestStamp(1000, context);
+        context = "target:2/role:Follower";
+        var worldTime = new DateTime(2026, 11, 11, 9, 0, 0, DateTimeKind.Utc);
+        var decision = request.Complete(new NavigationDecision { Sequence = 42, RequestedAt = worldTime }, 1010, 1020);
+        Assert.Equal(42, decision.Sequence);
+        Assert.Equal("target:1/role:Leader", decision.RequestContext);
+        Assert.NotEqual(context, decision.RequestContext);
+        Assert.Equal(worldTime, decision.RequestedAt);
+        Assert.Equal(1000, decision.RequestedAtMilliseconds);
+        Assert.Equal(1010, decision.BuildStartedAtMilliseconds);
+        Assert.Equal(1020, decision.BuildCompletedAtMilliseconds);
+        Assert.Equal(0, decision.ConsumedAtMilliseconds);
+    }
+
     [Theory]
     [InlineData(0.005f, true, true)]
     [InlineData(0.05f, true, false)]

@@ -6,4 +6,8 @@ public interface IAutoDungeonAutorotationConfig
 {
     bool AutoActivateDungeonAI { get; set; }
     bool AutoLeaveAfterBossDefeat { get; set; }
+    int TargetBossFloor { get; }
+    bool IsDungeonFollower { get; }
+    float DungeonFollowDistance { get; }
+    float DungeonMaxLeadDistance { get; }
 }

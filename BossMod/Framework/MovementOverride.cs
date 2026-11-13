@@ -40,7 +40,9 @@ public sealed unsafe class MovementOverride(
         long InteractionSampleAtMilliseconds,
         long HookCalls,
         long NonzeroOutputs,
-        long ZeroOutputs);
+        long ZeroOutputs,
+        long NavigationDecisionSequence,
+        long NavigationIntentAtMilliseconds);
 
     public Vector3? DesiredDirection { get; set; }
     public Angle MisdirectionThreshold { get; set; }
@@ -71,12 +73,23 @@ public sealed unsafe class MovementOverride(
     private long _hookCalls;
     private long _nonzeroOutputs;
     private long _zeroOutputs;
+    private long _navigationIntentSequence;
+    private long _navigationIntentAt;
+    private long _lastNavigationSequence;
+    private long _lastNavigationIntentAt;
 
     public DiagnosticSnapshot ReadDiagnosticSnapshot() => new(
         Interlocked.Read(ref _lastMovementSampleAt), _lastDesiredDirection, _lastUserMove, _lastActualMove, _lastFinalOutput,
         _lastAdditiveInput, _lastInputEnabled1, _lastInputEnabled2, _lastMovementAllowed, _lastMovementBlocked, _lastFollowPathActive, _lastMisdirection,
         _interactionMovementSuppressed, _interactionTargetID, Interlocked.Read(ref _interactionSampleAtMilliseconds),
-        Interlocked.Read(ref _hookCalls), Interlocked.Read(ref _nonzeroOutputs), Interlocked.Read(ref _zeroOutputs));
+        Interlocked.Read(ref _hookCalls), Interlocked.Read(ref _nonzeroOutputs), Interlocked.Read(ref _zeroOutputs),
+        _lastNavigationSequence, _lastNavigationIntentAt);
+
+    public void RecordNavigationIntent(long sequence)
+    {
+        _navigationIntentSequence = sequence;
+        _navigationIntentAt = Environment.TickCount64;
+    }
 
     public void RecordInteractionMovementSuppression(bool suppressed, ulong targetID)
     {
@@ -243,6 +256,8 @@ public sealed unsafe class MovementOverride(
         _lastMovementBlocked = MovementBlocked;
         _lastFollowPathActive = followPathActive;
         _lastMisdirection = misdirectionMode;
+        _lastNavigationSequence = _navigationIntentSequence;
+        _lastNavigationIntentAt = _navigationIntentAt;
         Interlocked.Exchange(ref _lastMovementSampleAt, Environment.TickCount64);
         Interlocked.Increment(ref _hookCalls);
         if (output != default)

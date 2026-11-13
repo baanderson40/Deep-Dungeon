@@ -17,7 +17,7 @@ using System.Threading.Tasks;
 
 namespace BossMod.Services;
 
-internal sealed class TickService(
+internal sealed partial class TickService(
     ILogger<DisposableMediatorSubscriberBase> mLogger,
     MediatorService mediator,
     [KeyFilter(Keys.ConfigDirectory)] DirectoryInfo configDir,
@@ -46,7 +46,7 @@ internal sealed class TickService(
     IEnumerable<MainDebugWindow> debugWindow
 ) : DisposableMediatorSubscriberBase(mLogger, mediator), IHostedService
 {
-    private enum DeepDungeonDepartureStage { None, BossDefeated, LeaveRequested, PostLeaveTerritory, WaitingRoom, MovingToExit, InteractingWithExit }
+    private enum DeepDungeonDepartureStage { None, BossDefeated, LeaveRequested, PostLeaveTerritory, WaitingRoom, MovingToExit, InteractingWithExit, AwaitingExitTransition }
 
 #nullable disable
     private BossModuleMainWindow _wndBossmod;
@@ -78,6 +78,7 @@ internal sealed class TickService(
     private bool _trackedBossWasAlive;
     private bool _deepDungeonBossDefeated;
     private bool _completionAutorotationSuppressed;
+    private long _completionSuppressionToken;
     private ushort _bossSourceTerritory;
     private ushort _expectedWaitingTerritory;
     private ushort _postLeaveTerritory;
@@ -95,6 +96,9 @@ internal sealed class TickService(
     private DateTime _lastExitDiscoveryStatusAt;
     private int _exitDiscoveryPollCount;
     private bool _exitDiscoveryTimedOut;
+    private long _exitConfirmationArmedAt;
+    private long _exitConfirmationSubmittedAt;
+    private bool _exitConfirmationVisible;
     private bool _departurePathOwned;
     private bool _departurePathStopWhenReady;
     private bool? _lastVnavReady;
@@ -110,6 +114,7 @@ internal sealed class TickService(
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
+        _continuationMapSubscription = worldstateGlobal.DeepDungeon.MapDataChanged.Subscribe(_ => ObserveContinuationMap());
         MigratePlans(configDir.FullName);
 
         _wndConfig = new(new(worldstateGlobal, replayDir, rotationDB));
@@ -158,6 +163,8 @@ internal sealed class TickService(
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
+        _continuationMapSubscription?.Dispose();
+        _continuationMapSubscription = null;
         clientState.Logout -= OnLogout;
 
         uiBuilder.Draw -= Update;
@@ -166,6 +173,7 @@ internal sealed class TickService(
 
         condition.ConditionChange -= OnConditionChanged;
         StopOwnedDeparturePath("service stopping");
+        ReleaseCompletionSuppression();
     }
 
     void Update()
@@ -227,7 +235,7 @@ internal sealed class TickService(
                 _deepDungeonTerritory = worldstateGlobal.CurrentZone;
             }
 
-            _autoDDConfig ??= ResolveAutoDDConfig(configRoot);
+            _autoDDConfig = ResolveAutoDDConfig(configRoot);
             var autoActivationEnabled = _autoDDConfig?.AutoActivateDungeonAI == true;
             if (autoActivationEnabled && !_autoActivationWasEnabled)
             {
@@ -240,6 +248,7 @@ internal sealed class TickService(
             if (_autoDungeonPreset != null && rotation.PresetSelectionVersion != _presetVersionAfterAutoActivation)
             {
                 // A manager-mediated user or safety change takes precedence over automation.
+                ReleaseCompletionSuppression();
                 _autoDungeonPreset = null;
                 _presetsBeforeAutoDungeon = null;
                 _deepDungeonSuspended = true;
@@ -340,12 +349,18 @@ internal sealed class TickService(
     private void UpdateDeepDungeonBossCompletion()
     {
         var dd = worldstateGlobal.DeepDungeon;
-        _autoDDConfig ??= ResolveAutoDDConfig(configRoot);
+        _autoDDConfig = ResolveAutoDDConfig(configRoot);
         if (_autoDDConfig?.AutoLeaveAfterBossDefeat != true)
         {
+            StopOwnedDeparturePath("automatic departure disabled");
             if (_completionAutorotationSuppressed)
                 ReleaseAutomaticDungeonPreset(restorePrevious: true);
             ResetDeepDungeonBossCompletion();
+            return;
+        }
+        if (_continuation != null)
+        {
+            ObserveContinuationArrival();
             return;
         }
         if (dd.DungeonId == DeepDungeonState.DungeonType.None || dd.Floor == 0 || !dd.IsBossFloor)
@@ -403,17 +418,23 @@ internal sealed class TickService(
         };
         worldstateGlobal.DeepDungeon.BossCompletionObserved = true;
         hintsGlobal.ActionsToExecute.Entries.RemoveAll(entry => !entry.Manual && entry.Action.Type == ActionType.Pomander);
-        if (_autoDungeonPreset != null && rotation.PresetSelectionVersion == _presetVersionAfterAutoActivation)
+        if (_autoDungeonPreset != null && rotation.PresetSelectionVersion == _presetVersionAfterAutoActivation
+            && rotation.Presets.Contains(_autoDungeonPreset))
         {
-            rotation.SetForceDisabled();
+            _completionSuppressionToken = rotation.BeginDeepDungeonCompletionSuppression();
             _presetVersionAfterAutoActivation = rotation.PresetSelectionVersion;
             _completionAutorotationSuppressed = true;
         }
-        logger.Info($"[AutoDD] Supported boss defeat observed: dungeon={dd.DungeonId}, floor={dd.Floor}, module={_trackedDeepDungeonBossType?.Name}, actor={actor.InstanceID}; owned autorotation suppressed before leave request.");
+        logger.Info($"[AutoDD] Supported boss defeat observed: dungeon={dd.DungeonId}, floor={dd.Floor}, module={_trackedDeepDungeonBossType?.Name}, actor={actor.InstanceID}; completionSuppressionOwned={rotation.OwnsDeepDungeonCompletionSuppression(_completionSuppressionToken)}, token={_completionSuppressionToken}, presetVersion={rotation.PresetSelectionVersion}; awaiting leave readiness.");
+        BeginContinuationIfRequested();
     }
 
     private void ResetDeepDungeonBossCompletion()
     {
+        ReleaseCompletionSuppression();
+        _continuation = null;
+        worldstateGlobal.DeepDungeon.ContinuationStatus = null;
+        worldstateGlobal.DeepDungeon.ContinuationRetryRequested = false;
         worldstateGlobal.DeepDungeon.BossCompletionObserved = false;
         _trackedDeepDungeonBossType = null;
         _trackedDeepDungeonBossActor = null;
@@ -428,16 +449,23 @@ internal sealed class TickService(
         _departureStageChangedAt = default;
         _departureManualInputResumeAt = default;
         _lastManualInputDiagnosticAt = default;
-        _departureExitActorID = 0;
-        _departureExitRawAddress = IntPtr.Zero;
-        _departureExitRawEntityID = 0;
-        _departureExitPosition = default;
-        _departureExitHitbox = 0;
+        if (!_departurePathStopWhenReady)
+        {
+            _departureExitActorID = 0;
+            _departureExitRawAddress = IntPtr.Zero;
+            _departureExitRawEntityID = 0;
+            _departureExitPosition = default;
+            _departureExitHitbox = 0;
+        }
         _exitDiscoveryStartedAt = default;
         _nextExitDiscoveryPollAt = default;
         _lastExitDiscoveryStatusAt = default;
         _exitDiscoveryPollCount = 0;
         _exitDiscoveryTimedOut = false;
+        _exitConfirmationArmedAt = 0;
+        _exitConfirmationSubmittedAt = 0;
+        _exitConfirmationVisible = false;
+        _lastDepartureIntent = null;
     }
 
     private void UpdateDeepDungeonDepartureHints()
@@ -445,7 +473,7 @@ internal sealed class TickService(
         if (!_deepDungeonBossDefeated || _departureStage == DeepDungeonDepartureStage.None)
             return;
 
-        _autoDDConfig ??= ResolveAutoDDConfig(configRoot);
+        _autoDDConfig = ResolveAutoDDConfig(configRoot);
         if (_autoDDConfig?.AutoLeaveAfterBossDefeat != true)
         {
             StopOwnedDeparturePath("automatic boss leave disabled");
@@ -456,6 +484,7 @@ internal sealed class TickService(
         if (_autoDungeonPreset != null && rotation.PresetSelectionVersion != _presetVersionAfterAutoActivation)
         {
             StopOwnedDeparturePath("preset selection changed");
+            ReleaseCompletionSuppression();
             _autoDungeonPreset = null;
             _presetsBeforeAutoDungeon = null;
             _completionAutorotationSuppressed = false;
@@ -463,11 +492,19 @@ internal sealed class TickService(
             return;
         }
 
+        if (ContinuationBlocksDeparture())
+            return;
+
         var currentTerritory = worldstateGlobal.CurrentZone;
         var manualInput = movementOverride.IsManualMoveRequested();
         var now = worldstateGlobal.CurrentTime;
         if (manualInput)
             _departureManualInputResumeAt = now + TimeSpan.FromMilliseconds(750);
+        if (manualInput && ContinuationHasPendingUi())
+        {
+            FailContinuation("manual movement interrupted pending entry UI");
+            return;
+        }
         if (_departurePathOwned && manualInput)
         {
             StopOwnedDeparturePath("manual movement input detected");
@@ -482,6 +519,8 @@ internal sealed class TickService(
                 _departureStage = DeepDungeonDepartureStage.PostLeaveTerritory;
                 _departureStageChangedAt = worldstateGlobal.CurrentTime;
                 logger.Warning("[AutoDD] boss-floor leave request timed out; automatic leave retries stopped, completion suppression retained.");
+                if (_continuation != null)
+                    FailContinuation("boss-floor leave timed out after two minutes");
                 return;
             }
             if (_departureStage is DeepDungeonDepartureStage.BossDefeated or DeepDungeonDepartureStage.LeaveRequested
@@ -490,7 +529,7 @@ internal sealed class TickService(
             {
                 if (_departureStage == DeepDungeonDepartureStage.BossDefeated)
                 {
-                    logger.Info($"[AutoDD] boss-floor leave request ready: dungeon={_trackedBossDungeon}, floor={_trackedBossFloor}, territory={_bossSourceTerritory}.");
+                    logger.Info($"[AutoDD] boss-floor leave request ready: dungeon={_trackedBossDungeon}, floor={_trackedBossFloor}, territory={_bossSourceTerritory}, target={_autoDDConfig.TargetBossFloor}.");
                     _departureStage = DeepDungeonDepartureStage.LeaveRequested;
                     _departureStageChangedAt = worldstateGlobal.CurrentTime;
                 }
@@ -503,7 +542,7 @@ internal sealed class TickService(
 
         if (_expectedWaitingTerritory != 0 && currentTerritory == _expectedWaitingTerritory)
         {
-            if (_departureStage is not (DeepDungeonDepartureStage.WaitingRoom or DeepDungeonDepartureStage.MovingToExit or DeepDungeonDepartureStage.InteractingWithExit))
+            if (_departureStage is not (DeepDungeonDepartureStage.WaitingRoom or DeepDungeonDepartureStage.MovingToExit or DeepDungeonDepartureStage.InteractingWithExit or DeepDungeonDepartureStage.AwaitingExitTransition))
             {
                 _departureStage = DeepDungeonDepartureStage.WaitingRoom;
                 _departureStageChangedAt = worldstateGlobal.CurrentTime;
@@ -531,14 +570,19 @@ internal sealed class TickService(
             CompleteDeepDungeonDeparture($"left post-boss territory; previous={_postLeaveTerritory}, current={currentTerritory}");
             return;
         }
-        else if (_departureStage is DeepDungeonDepartureStage.WaitingRoom or DeepDungeonDepartureStage.MovingToExit or DeepDungeonDepartureStage.InteractingWithExit)
+        else if (_departureStage is DeepDungeonDepartureStage.WaitingRoom or DeepDungeonDepartureStage.MovingToExit or DeepDungeonDepartureStage.InteractingWithExit or DeepDungeonDepartureStage.AwaitingExitTransition)
         {
+            if (_continuation != null)
+            {
+                ObserveContinuationTerritoryChange();
+                return;
+            }
             StopOwnedDeparturePath("waiting-room territory changed");
             CompleteDeepDungeonDeparture($"left waiting room; current territory={currentTerritory}");
             return;
         }
 
-        if (_departureStage is not (DeepDungeonDepartureStage.WaitingRoom or DeepDungeonDepartureStage.MovingToExit or DeepDungeonDepartureStage.InteractingWithExit))
+        if (_departureStage is not (DeepDungeonDepartureStage.WaitingRoom or DeepDungeonDepartureStage.MovingToExit or DeepDungeonDepartureStage.InteractingWithExit or DeepDungeonDepartureStage.AwaitingExitTransition))
             return;
 
         if (currentTerritory != _expectedWaitingTerritory
@@ -560,9 +604,27 @@ internal sealed class TickService(
         if (!DeepDungeonPolicy.CanSearchWaitingRoomExit(Utils.IsScreenReady(), IsLoadingOrTransitioning()))
         {
             StopOwnedDeparturePath("waiting for screen readiness before Exit discovery");
-            LogDepartureDiagnostic("waiting for screen ready before scanning waiting-room Exit");
+            LogDepartureDiagnostic(_continuation != null ? "waiting for screen readiness for waiting-room continuation"
+                : _departureStage == DeepDungeonDepartureStage.AwaitingExitTransition ? "Exit Yes submitted; waiting for screen/territory transition"
+                : "waiting for screen ready before scanning waiting-room Exit");
             return;
         }
+
+        if (_continuation == null && !EnsureFinalExitAllowed())
+            return;
+
+        if (_continuation != null && UpdateWaitingRoomContinuation(player))
+            return;
+
+        if (DeepDungeonMenuVisible())
+        {
+            StopOwnedDeparturePath("unowned DeepDungeonMenu visible");
+            LogDepartureDiagnostic("unowned DeepDungeonMenu left untouched; Exit approach paused");
+            return;
+        }
+
+        if (UpdateDepartureExitConfirmation())
+            return;
 
         if (_exitDiscoveryStartedAt == default)
         {
@@ -571,7 +633,7 @@ internal sealed class TickService(
             _lastExitDiscoveryStatusAt = default;
             _exitDiscoveryPollCount = 0;
             _exitDiscoveryTimedOut = false;
-            LogDepartureTransition($"waiting-room Exit discovery polling started: 30s window, territory={currentTerritory}");
+            LogDepartureTransition($"waiting-room Exit discovery polling started: 30s window, territory={currentTerritory}, target={_autoDDConfig?.TargetBossFloor}, intent=Exit");
         }
 
         var expectedExitOID = DeepDungeonPolicy.WaitingRoomExitBaseID(_trackedBossDungeon, currentTerritory);
@@ -697,6 +759,8 @@ internal sealed class TickService(
                 hintsGlobal.InteractWithTarget = exit;
             else
                 hintsGlobal.InteractWithRawTarget = rawExit;
+            hintsGlobal.OnInteractionIssued = ArmDepartureExitConfirmation;
+            hintsGlobal.CanIssueInteraction = CanDispatchDepartureExitInteraction;
             if (_departureStage != DeepDungeonDepartureStage.InteractingWithExit)
             {
                 _departureStage = DeepDungeonDepartureStage.InteractingWithExit;
@@ -707,6 +771,105 @@ internal sealed class TickService(
         }
 
         UpdateDepartureVnav(player, exitID, exitOID, destination, range, centerDistance);
+    }
+
+    private void ArmDepartureExitConfirmation(ulong exitID)
+    {
+        if (_exitConfirmationArmedAt != 0 || _departureStage != DeepDungeonDepartureStage.InteractingWithExit
+            || exitID != _departureExitActorID || worldstateGlobal.CurrentZone != _expectedWaitingTerritory)
+            return;
+        _exitConfirmationArmedAt = Environment.TickCount64;
+        LogDepartureTransition($"Exit interaction dispatched: exit={exitID:X}, target={_autoDDConfig?.TargetBossFloor}; awaiting localized SelectYesno confirmation");
+    }
+
+    private bool CanDispatchDepartureExitInteraction(ulong exitID)
+        => exitID == _departureExitActorID && _departureStage == DeepDungeonDepartureStage.InteractingWithExit
+            && worldstateGlobal.CurrentZone == _expectedWaitingTerritory
+            && !IsLoadingOrTransitioning() && Utils.IsScreenReady() && !movementOverride.IsManualMoveRequested()
+            && rotation.Player is { IsDead: false, InCombat: false, CastInfo: null }
+            && _exitConfirmationArmedAt == 0 && _exitConfirmationSubmittedAt == 0
+            && EnsureFinalExitAllowed();
+
+    // Runs before rediscovering the Exit: opening its dialog may change the object's targetability.
+    private unsafe bool UpdateDepartureExitConfirmation()
+    {
+        var now = Environment.TickCount64;
+        if (_exitConfirmationSubmittedAt != 0)
+        {
+            if (now - _exitConfirmationSubmittedAt >= DeepDungeonExitConfirmation.TransitionTimeoutMs)
+                CancelDeepDungeonDeparture("Exit Yes callback issued but no territory transition observed within 30s");
+            return true;
+        }
+        if (!EnsureFinalExitAllowed())
+            return true;
+        if (_exitConfirmationArmedAt != 0 && now - _exitConfirmationArmedAt >= DeepDungeonExitConfirmation.PromptTimeoutMs)
+        {
+            CancelDeepDungeonDeparture("Exit confirmation missing or unrecognized after 10s; no automatic retry");
+            return true;
+        }
+
+        try
+        {
+            var addon = (FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase*)gameGui.GetAddonByName("SelectYesno").Address;
+            var visible = addon != null && addon->IsVisible;
+            if (!visible)
+            {
+                if (_exitConfirmationArmedAt == 0)
+                    return false;
+                if (_exitConfirmationVisible)
+                    CancelDeepDungeonDeparture("Exit confirmation dismissed without an automatic Yes callback; respecting cancellation");
+                return true;
+            }
+
+            StopOwnedDeparturePath("confirmation dialog visible");
+            if (_exitConfirmationArmedAt == 0)
+            {
+                LogDepartureDiagnostic("unowned SelectYesno visible; not interacting or confirming");
+                return true;
+            }
+            _exitConfirmationVisible = true;
+            if (!addon->IsReady || addon->AtkValues == null || addon->AtkValuesCount < 3)
+                return true;
+            var prompt = addon->AtkValues[0];
+            if (prompt.Type is not (FFXIVClientStructs.FFXIV.Component.GUI.AtkValueType.String
+                or FFXIVClientStructs.FFXIV.Component.GUI.AtkValueType.ManagedString
+                or FFXIVClientStructs.FFXIV.Component.GUI.AtkValueType.ConstString) || (byte*)prompt.String == null)
+                return true;
+
+            var row = DeepDungeonExitConfirmation.WarpQuestionRow(_trackedBossDungeon, worldstateGlobal.CurrentZone);
+            var expected = row != 0 ? Service.LuminaRow<Lumina.Excel.Sheets.Warp>(row)?.Question.ToString() : null;
+            var actual = Dalamud.Game.Text.SeStringHandling.SeString.Parse(prompt.String).TextValue;
+            var player = rotation.Player;
+            var owned = _departureStage == DeepDungeonDepartureStage.InteractingWithExit && _departureExitActorID != 0
+                && player != null && Vector3.Distance(player.PosRot.XYZ(), _departureExitPosition) <= _departureExitHitbox + 2.5f;
+            if (!DeepDungeonExitConfirmation.CanConfirm(_trackedBossDungeon, worldstateGlobal.CurrentZone, owned, true,
+                _exitConfirmationArmedAt, now, false, expected, actual))
+            {
+                LogDepartureDiagnostic($"SelectYesno left untouched: owned={owned}, WarpQuestion={row}, localized prompt matches={string.Equals(expected?.Trim(), actual.Trim(), StringComparison.Ordinal)}");
+                return true;
+            }
+
+            // Re-read current config at the irreversible boundary, not just during hint production.
+            if (!EnsureFinalExitAllowed())
+                return true;
+
+            // SelectYesno's first (Yes) choice is callback argument 0. Submit only once.
+            var value = new FFXIVClientStructs.FFXIV.Component.GUI.AtkValue
+            {
+                Type = FFXIVClientStructs.FFXIV.Component.GUI.AtkValueType.Int,
+                Int = 0,
+            };
+            _exitConfirmationSubmittedAt = now;
+            _departureStage = DeepDungeonDepartureStage.AwaitingExitTransition;
+            addon->FireCallback(1, &value, true);
+            LogDepartureTransition($"localized Exit confirmation Yes callback issued: WarpQuestion={row}, target={_autoDDConfig?.TargetBossFloor}, intent=Exit; awaiting territory transition, departure not yet confirmed");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            CancelDeepDungeonDeparture($"Exit confirmation unavailable/error: {ex.GetType().Name}: {ex.Message}");
+            return true;
+        }
     }
 
     private static bool IsUsableDepartureEntityID(ulong entityID)
@@ -738,7 +901,7 @@ internal sealed class TickService(
         logger.Info($"[AutoDD] departure confirmed: {reason}.");
     }
 
-    private void UpdateDepartureVnav(Actor player, ulong exitID, uint exitOID, Vector3 destination, float range, float distance)
+    private void UpdateDepartureVnav(Actor player, ulong exitID, uint exitOID, Vector3 destination, float range, float distance, string targetKind = "Exit")
     {
         try
         {
@@ -771,29 +934,29 @@ internal sealed class TickService(
                     if (!matches)
                     {
                         _departurePathOwned = false;
-                        LogDepartureDiagnostic($"ownership lost: live path endpoint does not match Exit {exitID:X}; path left untouched");
+                        LogDepartureDiagnostic($"ownership lost: live path endpoint does not match {targetKind} {exitID:X}; path left untouched");
                         return;
                     }
-                    LogDepartureDiagnostic($"owned path active: exit={exitID:X}, stopRange={range:F2}, waypoints={waypoints.Count}");
+                    LogDepartureDiagnostic($"owned path active: target={targetKind}/{exitID:X}, stopRange={range:F2}, waypoints={waypoints.Count}");
                     return;
                 }
 
                 if (pathfindInProgress)
                 {
-                    LogDepartureDiagnostic($"owned pathfinding pending: exit={exitID:X}, stopRange={range:F2}");
+                    LogDepartureDiagnostic($"owned pathfinding pending: target={targetKind}/{exitID:X}, stopRange={range:F2}");
                     return;
                 }
 
                 _departurePathOwned = false;
                 _departurePathStopWhenReady = false;
                 _departureStage = DeepDungeonDepartureStage.WaitingRoom;
-                LogDepartureDiagnostic($"owned path ended before arrival: exit={exitID:X}, playerDistance={distance:F2}; retry eligible");
+                LogDepartureDiagnostic($"owned path ended before arrival: target={targetKind}/{exitID:X}, playerDistance={distance:F2}; retry eligible");
             }
 
             // An existing vnav route or pathfind belongs to another controller. Never replace it.
             if (!DeepDungeonPolicy.ShouldStartDeparturePath(ready, pathRunning, pathfindInProgress, true, rotation.Player is { IsDead: false, InCombat: false, CastInfo: null }))
             {
-                LogDepartureDiagnostic($"vnav busy with unowned path; not taking control: exit={exitID:X}");
+                LogDepartureDiagnostic($"vnav busy with unowned path; not taking control: target={targetKind}/{exitID:X}");
                 return;
             }
 
@@ -803,11 +966,11 @@ internal sealed class TickService(
                 _departurePathOwned = true;
                 _departureStage = DeepDungeonDepartureStage.MovingToExit;
                 _departureStageChangedAt = worldstateGlobal.CurrentTime;
-                LogDepartureTransition($"vnav approach requested: exit={exitID:X}, baseID={exitOID}, position={destination}, stopRange={range:F2}, playerDistance={distance:F2}");
+                LogDepartureTransition($"vnav approach requested: target={targetKind}/{exitID:X}, baseID={exitOID}, position={destination}, stopRange={range:F2}, playerDistance={distance:F2}");
             }
             else
             {
-                LogDepartureDiagnostic($"vnav rejected approach request: exit={exitID:X}, position={destination}, stopRange={range:F2}, playerDistance={distance:F2}");
+                LogDepartureDiagnostic($"vnav rejected approach request: target={targetKind}/{exitID:X}, position={destination}, stopRange={range:F2}, playerDistance={distance:F2}");
             }
         }
         catch (Exception ex)
@@ -918,11 +1081,16 @@ internal sealed class TickService(
     private void ReleaseAutomaticDungeonPreset(bool restorePrevious)
     {
         if (_autoDungeonPreset == null)
+        {
+            ReleaseCompletionSuppression();
             return;
+        }
 
         var canRestore = restorePrevious
             && rotation.PresetSelectionVersion == _presetVersionAfterAutoActivation
-            && (rotation.Presets.Contains(_autoDungeonPreset) || _completionAutorotationSuppressed && rotation.IsForceDisabled);
+            && (rotation.Presets.Contains(_autoDungeonPreset)
+                || _completionAutorotationSuppressed && rotation.OwnsDeepDungeonCompletionSuppression(_completionSuppressionToken));
+        ReleaseCompletionSuppression();
         if (canRestore)
         {
             rotation.Clear();
@@ -938,6 +1106,13 @@ internal sealed class TickService(
 
         _autoDungeonPreset = null;
         _presetsBeforeAutoDungeon = null;
+        _completionAutorotationSuppressed = false;
+    }
+
+    private void ReleaseCompletionSuppression()
+    {
+        rotation.ReleaseDeepDungeonCompletionSuppression(_completionSuppressionToken);
+        _completionSuppressionToken = 0;
         _completionAutorotationSuppressed = false;
     }
 
@@ -999,6 +1174,8 @@ internal sealed class TickService(
         if (!disposing)
             return;
 
+        _continuationMapSubscription?.Dispose();
+        ReleaseCompletionSuppression();
         _wndChangelog.Dispose();
         _wndAI.Dispose();
         _wndRotation.Dispose();

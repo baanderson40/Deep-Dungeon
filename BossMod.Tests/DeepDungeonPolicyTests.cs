@@ -291,6 +291,34 @@ public class DeepDungeonPolicyTests
         => Assert.False(DeepDungeonPolicy.IsInForwardRoomRoute(default, default, default, 0, 10));
 
     [Fact]
+    public void ExplicitCoordinationHoldIsNotReportedAsPathfindingStall()
+    {
+        Assert.Equal(DeepDungeonPolicy.MovementDiagnosticKind.IntentionalCoordinationHold,
+            DeepDungeonPolicy.ClassifyMovementDiagnostic(false, false, false, false, false, false, false, 1, null, true));
+        Assert.Equal(DeepDungeonPolicy.MovementDiagnosticKind.IntentionalCoordinationHold,
+            DeepDungeonPolicy.ClassifyMovementDiagnostic(false, false, false, false, false, true, false, 1, 1, true));
+        Assert.Equal(DeepDungeonPolicy.MovementDiagnosticKind.IntentionalCoordinationHold,
+            DeepDungeonPolicy.ClassifyMovementDiagnostic(true, false, false, false, false, false, false, 1, null, true));
+        Assert.NotEqual(DeepDungeonPolicy.MovementDiagnosticKind.IntentionalCoordinationHold,
+            DeepDungeonPolicy.ClassifyMovementDiagnostic(false, false, false, false, false, true, true, 0, 1, true));
+        Assert.Equal(DeepDungeonPolicy.MovementDiagnosticKind.InteractionHold,
+            DeepDungeonPolicy.ClassifyMovementDiagnostic(false, false, true, false, false, false, false, 1, null, true));
+    }
+
+    [Fact]
+    public void RequestedNavigationSnapshotWithoutSustainedStationarityIsNotAStall()
+    {
+        Assert.Equal(DeepDungeonPolicy.MovementDiagnosticKind.NavigationSnapshot,
+            DeepDungeonPolicy.ClassifyMovementDiagnostic(false, false, false, false, false, true, true, 0, 2,
+                diagnosticSnapshot: true));
+        Assert.Equal(DeepDungeonPolicy.MovementDiagnosticKind.IntentionalCoordinationHold,
+            DeepDungeonPolicy.ClassifyMovementDiagnostic(false, false, false, false, false, false, false, 2, null,
+                intentionalHold: true, diagnosticSnapshot: true));
+        Assert.Equal(DeepDungeonPolicy.MovementDiagnosticKind.NavigationStall,
+            DeepDungeonPolicy.ClassifyMovementDiagnostic(false, false, false, false, false, true, true, 0, 2));
+    }
+
+    [Fact]
     public void RoomRouteGoalCoversLocalMapWhenApproachingSourceRoomFromHallway()
     {
         var source = new WPos(-304.3f, 355.0f);
@@ -340,7 +368,7 @@ public class DeepDungeonPolicyTests
                 oldMaskKeptRouteCell = true;
 
             // This route cell crossed the old player-forward-10 exclusion as position/map raster shifted.
-            Assert.Equal(0.01f * (0.5f + 0.5f * Math.Clamp((routeCell - source).Dot((next - source).Normalized()) / routeLength, 0, 1)), directPriority, 5);
+            Assert.Equal(0.01f * (0.5f + 0.5f * Math.Clamp(((routeCell - source).Dot((next - source).Normalized()) - playerProgress) / (routeLength - playerProgress), 0, 1)), directPriority, 5);
             Assert.True(directPriority > detourPriority);
         }
 
@@ -354,6 +382,21 @@ public class DeepDungeonPolicyTests
     [InlineData(0, -20, 0, -10)]
     public void RoomRouteGoalSupportsAllCardinalDirections(float nextX, float nextZ, float pointX, float pointZ)
         => Assert.True(DeepDungeonPolicy.IsInForwardRoomRoute(new(pointX, pointZ), default, new(nextX, nextZ), 0, 2));
+
+    [Theory]
+    [InlineData(-33.5f)]
+    [InlineData(0)]
+    [InlineData(10)]
+    public void RoomRoutePriorityStrictlyRewardsForwardProgressFromCapturedPlayerProjection(float start)
+    {
+        var source = new WPos(0, 0);
+        var next = new WPos(60, 0);
+        var here = DeepDungeonPolicy.ForwardRoomRoutePriority(new(start, 0), source, next, start, 10, 0.01f);
+        var forward = DeepDungeonPolicy.ForwardRoomRoutePriority(new(start + 5, 0), source, next, start, 10, 0.01f);
+        Assert.True(forward > here);
+        Assert.Equal(0, DeepDungeonPolicy.ForwardRoomRoutePriority(new(start - 1, 0), source, next, start, 10, 0.01f));
+        Assert.Equal(0, DeepDungeonPolicy.ForwardRoomRoutePriority(new(start + 5, 11), source, next, start, 10, 0.01f));
+    }
 
     [Fact]
     public void AutomaticPomanderRequiresValidUsableStockAndPolicyEligibility()
@@ -955,8 +998,8 @@ public class DeepDungeonPolicyTests
     [Fact]
     public void TreasureStallDeferralUsesIndependentEligibleTimeAndHonorsControlHolds()
     {
-        Assert.True(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromSeconds(30), true, false, false, false, false));
-        Assert.False(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromSeconds(29.9), true, false, false, false, false));
+        Assert.True(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromSeconds(15), true, false, false, false, false));
+        Assert.False(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromSeconds(14.999), true, false, false, false, false));
         Assert.False(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromMinutes(2), false, false, false, false, false));
         Assert.False(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromMinutes(2), true, true, false, false, false));
         Assert.False(DeepDungeonPolicy.ShouldDeferStalledTreasure(TimeSpan.FromMinutes(2), true, false, true, false, false));
@@ -974,6 +1017,8 @@ public class DeepDungeonPolicyTests
             selectedAt, selectedAt.AddSeconds(5), selectedAt));
         Assert.Equal(TimeSpan.Zero, DeepDungeonPolicy.TreasureSelectedSampleDuration(
             selectedAt, selectedAt.AddMilliseconds(-1), selectedAt));
+        Assert.Equal(TimeSpan.Zero, DeepDungeonPolicy.TreasureSelectedSampleDuration(
+            selectedAt, selectedAt.AddMilliseconds(100), default)); // first eligible sample after a control hold
     }
 
     [Theory]

@@ -33,6 +33,7 @@ internal sealed class HintExecutor(WorldState ws, MovementOverride movementOverr
     public unsafe void Execute()
     {
         movementOverride.DesiredDirection = hints.ForcedMovement;
+        movementOverride.RecordNavigationIntent(hints.NavigationDecisionSequence);
         movementOverride.MisdirectionThreshold = hints.MisdirectionThreshold;
         movementOverride.DesiredSpinDirection = hints.SpinDirection;
 
@@ -85,8 +86,11 @@ internal sealed class HintExecutor(WorldState ws, MovementOverride movementOverr
             if (amex.EffectiveAnimationLock == 0 && ws.CurrentTime >= _throttleInteract)
             {
                 var objectToInteract = interactionTarget != null ? GetActorObject(interactionTarget) : GetRawObject(rawInteractionTarget);
-                if (objectToInteract != null)
+                if (objectToInteract != null && (hints.CanIssueInteraction?.Invoke(interactionTargetID) ?? true))
+                {
                     FFXIVClientStructs.FFXIV.Client.Game.Control.TargetSystem.Instance()->InteractWithObject(objectToInteract, false);
+                    hints.OnInteractionIssued?.Invoke(interactionTargetID);
+                }
                 RecordTreasureInteractionRequest(interactionTarget);
                 _throttleInteract = ws.FutureTime(0.1f);
             }
@@ -262,5 +266,5 @@ internal sealed class HintExecutor(WorldState ws, MovementOverride movementOverr
     }
 
     private static ulong GetRawObjectIdentity(Dalamud.Game.ClientState.Objects.Types.IGameObject obj)
-        => obj.EntityId != 0xE0000000 && (obj.EntityId & 0xFF000000) != 0xFF000000 ? obj.EntityId : unchecked((ulong)obj.Address.ToInt64());
+        => obj.EntityId != 0 && obj.EntityId != 0xE0000000 && (obj.EntityId & 0xFF000000) != 0xFF000000 ? obj.EntityId : unchecked((ulong)obj.Address.ToInt64());
 }

@@ -23,10 +23,26 @@ public sealed class AutoDDConfig : ConfigNode, IAutoDungeonAutorotationConfig
 
     [PropertyDisplay("Enable module", tooltip: "This is experimental. Use at your own risk. You will sometimes need to help the AI to navigate.")]
     public bool Enable = true;
+    public enum PartyRole { Leader, Follower }
+    [PropertyDisplay("Party role", tooltip: "Leader clears and waits for party members. Follower follows the actual party leader, assists engaged enemies, and stacks at passage; no independent pulls, loot, or pomanders.")]
+    public PartyRole Role = PartyRole.Leader;
+    [PropertyDisplay("Follower distance (y)")]
+    [PropertySlider(1, 15)]
+    public float FollowDistance = 3;
+    [PropertyDisplay("Regroup resume distance (y)")]
+    [PropertySlider(2, 25)]
+    public float RegroupResumeDistance = 8;
+    [PropertyDisplay("Maximum lead distance (y)")]
+    [PropertySlider(3, 40)]
+    public float MaxLeadDistance = 15;
     [PropertyDisplay("Automatically activate Dungeon AI", tooltip: "Automatically selects the built-in Dungeon AI preset while inside a Deep Dungeon. Manual preset changes suspend automatic control until you leave.")]
     public bool AutoActivateDungeonAI;
-    [PropertyDisplay("Automatically leave completely after boss defeat", tooltip: "Opt-in. Requires a supported VBM boss encounter to be observed alive and then dead. Leaves the boss floor, then uses vnav to approach the verified PotD or HoH waiting-room Exit and interacts with it.")]
     public bool AutoLeaveAfterBossDefeat;
+    public int TargetBossFloor;
+    int IAutoDungeonAutorotationConfig.TargetBossFloor => TargetBossFloor;
+    bool IAutoDungeonAutorotationConfig.IsDungeonFollower => Role == PartyRole.Follower;
+    float IAutoDungeonAutorotationConfig.DungeonFollowDistance => FollowDistance;
+    float IAutoDungeonAutorotationConfig.DungeonMaxLeadDistance => MaxLeadDistance;
     bool IAutoDungeonAutorotationConfig.AutoActivateDungeonAI
     {
         get => AutoActivateDungeonAI;
@@ -42,7 +58,7 @@ public sealed class AutoDDConfig : ConfigNode, IAutoDungeonAutorotationConfig
     [PropertyDisplay("Minimap scale")]
     [PropertySlider(0.2f, 3)]
     public float MinimapScale = 1.0f;
-    [PropertyDisplay("Try to avoid traps", tooltip: "Avoid known trap locations sourced from Palantir data. (Traps revealed by a Pomander of Sight will always be avoided.)")]
+    [PropertyDisplay("Try to avoid traps", tooltip: "Avoid historical Palantir trap locations initially. After a 15s stall, a validated, bounded crossing may accept the potential-trap risk. Traps revealed by a Pomander of Sight remain avoided.")]
     public bool TrapHints = true;
     [PropertyDisplay("Draw potential trap locations in game world")]
     public bool DrawTraps = false;
@@ -93,6 +109,46 @@ public sealed class AutoDDConfig : ConfigNode, IAutoDungeonAutorotationConfig
 
     public override void DrawCustom(string? page, UITree tree, WorldState ws, RotationDatabase? db)
     {
+        if (ws.DeepDungeon.PartyCoordinationStatus is { } partyStatus)
+        {
+            UIMisc.SectionHeader("Party coordination");
+            ImGui.TextWrapped(partyStatus);
+            if (Enable && ImGui.Button("Retry party coordination"))
+                ws.DeepDungeon.PartyCoordinationRetryRequested = true;
+        }
+        if (ws.DeepDungeon.RoomRejoinStatus is { } rejoinStatus)
+        {
+            UIMisc.SectionHeader("Room-route recovery");
+            ImGui.TextWrapped($"Room-route recovery: {rejoinStatus}");
+            if (Enable && ImGui.Button("Retry room-route recovery"))
+                ws.DeepDungeon.RoomRejoinRetryRequested = true;
+        }
+        UIMisc.SectionHeader("Post-boss departure");
+        if (ImGui.Checkbox("Automatically depart after boss defeat", ref AutoLeaveAfterBossDefeat))
+            Modified.Fire();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Leaves a confirmed defeated boss floor for the waiting room. Target 0 exits completely; a positive PotD target continues between sets until that boss is defeated. Use matching settings on every party client.");
+        using (ImRaii.Disabled(!AutoLeaveAfterBossDefeat))
+        {
+            var step = Math.Clamp(TargetBossFloor / 10, 0, 20);
+            var display = step == 0 ? "Exit after current boss" : $"Floor {step * 10} - defeat boss, then exit";
+            if (ImGui.SliderInt("Target boss floor (PotD)", ref step, 0, 20, display, ImGuiSliderFlags.NoInput))
+            {
+                TargetBossFloor = step * 10;
+                Modified.Fire();
+            }
+            ImGui.TextWrapped("0 exits after the current boss. Positive targets continue in PotD only, in ten-floor steps. Use matching departure/target settings on every client; only the party leader submits entry.");
+            if (!DeepDungeonContinuationPolicy.ValidTarget(TargetBossFloor))
+                ImGui.TextWrapped($"Invalid stored target {TargetBossFloor}: select 0 or a multiple of 10 through 200.");
+        }
+        if (ws.DeepDungeon.ContinuationStatus is { } continuationStatus)
+        {
+            ImGui.TextWrapped($"Continuation: {continuationStatus}");
+            if (AutoLeaveAfterBossDefeat && continuationStatus.StartsWith("STOPPED:", StringComparison.Ordinal)
+                && ImGui.Button("Retry waiting-room continuation (close menus first)"))
+                ws.DeepDungeon.ContinuationRetryRequested = true;
+        }
+
         UIMisc.SectionHeader("Auto Pom — Use Policies");
         {
             using var indent = ImRaii.PushIndent(ImGui.GetFrameHeight());

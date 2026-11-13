@@ -131,6 +131,38 @@ public sealed class AIHints
     public Actor? InteractWithTarget;
     // Direct object-table fallback for synchronized objects that have no usable network entity ID.
     public IGameObject? InteractWithRawTarget;
+    // Called only after an interaction was actually dispatched, not merely requested by hints.
+    public Action<ulong>? OnInteractionIssued;
+    public Func<ulong, bool>? CanIssueInteraction;
+    // Per-frame AutoDD role ownership. Captured safety/follow goals replace later combat chase goals.
+    public List<Func<WPos, float>>? DeepDungeonPartyGoals;
+    public bool DeepDungeonPartyMode;
+    public bool DeepDungeonBossPullAllowed;
+    public bool DeepDungeonRoleActive;
+    public string? NavigationRequestContext;
+    public long NavigationDecisionSequence;
+    public string? DeepDungeonPartyNavigationKey;
+    public string? DeepDungeonIntentionalHoldReason;
+    public string? DeepDungeonRoomRouteKey;
+    public Func<WPos, float>? DeepDungeonRoomRouteGoal;
+    // Last consumed room-only solve; survives Clear(). Never populated by mixed actor/advisory goals.
+    public (string? Key, long At, bool Failed) DeepDungeonRoomRouteResult;
+    // This reserved tag belongs only to historical Palantir predictions, never revealed traps/AOEs.
+    public const ulong DeepDungeonPotentialTrapTag = ulong.MaxValue - 1;
+    public Func<WPos, float>? DeepDungeonPotentialTrapDistance;
+    public string? DeepDungeonPotentialTrapObjectiveKey;
+    public Func<WPos, float>? DeepDungeonPotentialTrapObjective;
+    public bool DeepDungeonPotentialTrapCrossingEligible;
+    public bool DeepDungeonPotentialTrapCrossingRequested;
+    // Last consumed comparison; survives Clear(). Request timestamps prevent stale approval.
+    public (string? Key, long At, bool Available, bool Active) DeepDungeonPotentialTrapResult;
+    public WPos? DeepDungeonCoordinationGoal;
+    public float DeepDungeonCoordinationGoalRadius;
+    // Previous consumed solver result: deliberately survives Clear(), like treasure recovery signals.
+    public string? DeepDungeonCoordinationResultKey;
+    public bool DeepDungeonCoordinationResultSafe;
+    public DateTime DeepDungeonCoordinationManualAt;
+    public Func<WPos, bool>? DeepDungeonPartyCombatArea;
 
     // positioning: list of shapes that are either forbidden to stand in now or will be in near future
     // AI will try to move in such a way to avoid standing in any forbidden zone after its activation or outside of some restricted zone after its activation, even at the cost of uptime
@@ -159,6 +191,13 @@ public sealed class AIHints
         GoalZones.Add(goal);
         if (diagnosticOwner != null)
             GoalZoneOwners.Add((index, diagnosticOwner));
+    }
+
+    public void SetDeepDungeonPotentialTrapObjective(string? key)
+    {
+        var goals = GoalZones.ToArray(); // freeze DD-owned goals before rotation chase goals are added
+        DeepDungeonPotentialTrapObjectiveKey = key;
+        DeepDungeonPotentialTrapObjective = key != null && goals.Length > 0 ? p => goals.Sum(g => g(p)) : null;
     }
 
     public class TempObstaclesList : List<Sdf>
@@ -234,6 +273,26 @@ public sealed class AIHints
         SpinDirection = null;
         InteractWithTarget = null;
         InteractWithRawTarget = null;
+        OnInteractionIssued = null;
+        CanIssueInteraction = null;
+        DeepDungeonPartyGoals = null;
+        DeepDungeonPartyMode = false;
+        DeepDungeonBossPullAllowed = false;
+        DeepDungeonRoleActive = false;
+        NavigationRequestContext = null;
+        NavigationDecisionSequence = 0;
+        DeepDungeonPartyNavigationKey = null;
+        DeepDungeonIntentionalHoldReason = null;
+        DeepDungeonRoomRouteKey = null;
+        DeepDungeonRoomRouteGoal = null;
+        DeepDungeonPotentialTrapDistance = null;
+        DeepDungeonPotentialTrapObjectiveKey = null;
+        DeepDungeonPotentialTrapObjective = null;
+        DeepDungeonPotentialTrapCrossingEligible = false;
+        DeepDungeonPotentialTrapCrossingRequested = false;
+        DeepDungeonCoordinationGoal = null;
+        DeepDungeonCoordinationGoalRadius = 0;
+        DeepDungeonPartyCombatArea = null;
         ForbiddenZones.Clear();
         GoalZones.Clear();
         GoalZoneOwners.Clear();

@@ -100,6 +100,7 @@ public sealed class AIHintsBuilder : IDisposable
                 if (activeModule.Components.Count == 0)
                     CalculateAutoHints(hints, player, false);
                 activeModule.CalculateAIHints(playerSlot, player, playerAssignment, hints, Obstacles);
+                _zmm.ActiveModule?.CalculateEncounterAIHints(playerSlot, player, hints);
             }
             else
             {

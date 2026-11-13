@@ -17,11 +17,25 @@
       <OutputItemType>Analyzer</OutputItemType>
       <PrivateAssets>All</PrivateAssets>
     </ProjectReference>
+    <ProjectReference Include="$(MSBuildThisFileDirectory)\CodeAnalysis.CodeFixes\CodeAnalysis.CodeFixes.csproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <OutputItemType>Analyzer</OutputItemType>
+      <PrivateAssets>All</PrivateAssets>
+    </ProjectReference>
   </ItemGroup>
 
   <Target Name="CopyDll" AfterTargets="Build" Condition="'$(Configuration)' == 'Debug'">
     <Copy
       SourceFiles="$(OutDir)\$(AssemblyName).dll"
       DestinationFolder="$(AppData)\vbm\modules-dev" />
+    <!-- Keep a portable dev deployment next to the actual core DLL, including UNC builds.
+         Query its target path rather than assuming x64/AnyCPU output directories match. -->
+    <MSBuild Projects="$(MSBuildThisFileDirectory)\BossMod\BossMod.csproj"
+             Targets="GetTargetPath"
+             Properties="Configuration=$(Configuration);Platform=$(Platform)">
+      <Output TaskParameter="TargetOutputs" ItemName="_BossModDeploymentTarget" />
+    </MSBuild>
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFolder="@(_BossModDeploymentTarget->'%(RootDir)%(Directory)modules-dev')" />
   </Target>
 </Project>

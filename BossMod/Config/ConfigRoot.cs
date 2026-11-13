@@ -11,6 +11,7 @@ public sealed class ConfigRoot : IDisposable
     public Version PreviousAssemblyVersion = new();
     record LazyNode(ConfigNode Node, EventSubscription OnModified);
     private readonly Dictionary<Type, LazyNode?> _nodes = []; // node is null if the type has been registered but the node has never been loaded before
+    private readonly HashSet<string> _reportedDuplicateProperties = [];
 
     public IEnumerable<Type> Nodes => _nodes.Keys;
 
@@ -99,7 +100,11 @@ public sealed class ConfigRoot : IDisposable
             var tmp = new FileInfo(Path.GetTempFileName());
 
             // preserve extra properties, as the corresponding nodes temporarily vanish during hotreload
-            var extraProperties = _payload.EnumerateObject().ToDictionary(t => t.Name, t => t.Value);
+            var extraProperties = ConfigPayload.PreserveProperties(_payload, name =>
+            {
+                if (_reportedDuplicateProperties.Add(name))
+                    Service.PluginLog.Warning($"Duplicate configuration key '{name}'; retaining the last stored value when saving.");
+            });
 
             ConfigConverter.Schema.Save(tmp, jwriter =>
             {

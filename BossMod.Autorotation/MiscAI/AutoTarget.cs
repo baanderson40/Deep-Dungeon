@@ -27,7 +27,7 @@ public sealed class AutoTarget(RotationModuleManager manager, Actor player) : Ro
             .AddOption(Flag.Disabled)
             .AddOption(Flag.Enabled);
 
-        res.Define(Track.DeepDungeon).As<Flag>("DD", "Prioritize deep dungeon bosses (solo only)", renderer: typeof(DefaultOffRenderer), uiPriority: -60)
+        res.Define(Track.DeepDungeon).As<Flag>("DD", "Prioritize deep dungeon bosses (solo or verified AutoDD party leader)", renderer: typeof(DefaultOffRenderer), uiPriority: -60)
             .AddOption(Flag.Disabled)
             .AddOption(Flag.Enabled);
 
@@ -95,7 +95,7 @@ public sealed class AutoTarget(RotationModuleManager manager, Actor player) : Ro
 
     public override void Execute(StrategyValues strategy, ref Actor? primaryTarget, float estimatedAnimLockDelay, bool isMoving)
     {
-        if (strategy.Option(Track.Treasure).As<Flag>() == Flag.Enabled)
+        if (Hints.DeepDungeonPartyGoals == null && strategy.Option(Track.Treasure).As<Flag>() == Flag.Enabled)
             Hints.InteractWithTarget ??= World.Actors.Where(a => a.Type == ActorType.Treasure && a.IsTargetable && !a.IsOpenTreasure).Closest(Player.Position);
 
         var generalOpt = strategy.Option(Track.General);
@@ -127,8 +127,13 @@ public sealed class AutoTarget(RotationModuleManager manager, Actor player) : Ro
         if (strategy.Option(Track.QuestBattle).As<Flag>() == Flag.Enabled)
             allowAll |= Bossmods.LoadedModules is [{ Info.Category: BossModuleInfo.Category.Quest }];
 
-        if (strategy.Option(Track.DeepDungeon).As<Flag>() == Flag.Enabled && World.Party.WithoutSlot(includeDead: true, excludeNPCs: true).Count() == 1)
-            allowAll |= Bossmods.LoadedModules is [{ Info.Category: BossModuleInfo.Category.DeepDungeon }];
+        ulong deepDungeonBossTarget = 0;
+        if (strategy.Option(Track.DeepDungeon).As<Flag>() == Flag.Enabled
+            && DeepDungeonPartyPolicy.CanPrioritizeBoss(World.Party.WithoutSlot(includeDead: true, excludeNPCs: true).Count() == 1,
+                Hints.DeepDungeonRoleActive, Hints.DeepDungeonBossPullAllowed)
+            && !World.DeepDungeon.BossCompletionObserved
+            && Bossmods.LoadedModules is [{ Info.Category: BossModuleInfo.Category.DeepDungeon, PrimaryActor: { IsTargetable: true, IsDeadOrDestroyed: false } boss }])
+            deepDungeonBossTarget = boss.InstanceID;
 
         if (strategy.Option(Track.EpicEcho).As<Flag>() == Flag.Enabled)
             allowAll |= Utils.IsUnsynced(World, Player);
@@ -165,6 +170,15 @@ public sealed class AutoTarget(RotationModuleManager manager, Actor player) : Ro
         // first deal with pulling new enemies
         foreach (var target in Hints.PotentialTargets)
         {
+            // Party-role filters must survive aggressive presets, without overriding retarget settings.
+            if (Hints.DeepDungeonPartyGoals != null && target.Priority < 0)
+                continue;
+            if (target.Actor.InstanceID == deepDungeonBossTarget && target.Priority >= AIHints.Enemy.PriorityUndesirable
+                && (canPullMore || target.Actor.InCombat || target.Actor.AggroPlayer))
+            {
+                prioritize(target, 0);
+                continue;
+            }
             if (target.Actor.InstanceID == huntTarget)
             {
                 prioritize(target, 0);

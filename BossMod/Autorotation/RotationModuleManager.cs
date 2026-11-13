@@ -39,6 +39,33 @@ public sealed class RotationModuleManager : IDisposable
     private Preset? PresetMultibox => Database.Presets.DefaultPresets.FirstOrDefault(p => p.Name == "VBM Multibox");
 
     public bool IsForceDisabled => Presets.Count == 1 && Presets[0] == ForceDisable;
+    private readonly CompletionSuppressionLease _completionSuppression = new();
+
+    internal long BeginDeepDungeonCompletionSuppression()
+    {
+        SetForceDisabled();
+        var token = _completionSuppression.Acquire(PresetSelectionVersion);
+        Service.Log($"[RMM] AutoDD completion suppression acquired: token={token}, presetVersion={PresetSelectionVersion}");
+        return token;
+    }
+
+    internal bool OwnsDeepDungeonCompletionSuppression(long token)
+        => _completionSuppression.Owns(token, PresetSelectionVersion, IsForceDisabled);
+
+    internal void ReleaseDeepDungeonCompletionSuppression(long token)
+    {
+        if (_completionSuppression.Release(token))
+            Service.Log($"[RMM] AutoDD completion suppression released: token={token}");
+    }
+
+    private bool InvalidateCompletionSuppression(string reason)
+    {
+        var token = _completionSuppression.Token;
+        if (!_completionSuppression.Invalidate())
+            return false;
+        Service.Log($"[RMM] AutoDD completion suppression overridden: token={token}, reason={reason}");
+        return true;
+    }
 
     public string PresetNames => Presets.Count > 0 ? string.Join(", ", Presets.Select(p => p.Name)) : "<n/a>";
 
@@ -117,6 +144,7 @@ public sealed class RotationModuleManager : IDisposable
 
     public void Dispose()
     {
+        _completionSuppression.Invalidate();
         _subscriptions.Dispose();
     }
 
@@ -161,10 +189,21 @@ public sealed class RotationModuleManager : IDisposable
 
         // auto actions
         var target = Hints.ForcedTarget ?? WorldState.Actors.Find(Player?.TargetID ?? 0);
+        if (Hints.DeepDungeonPartyGoals != null && target != null && Hints.FindEnemy(target) is not { Priority: >= 0 })
+        {
+            Hints.ForcedTarget = null;
+            target = null;
+        }
         foreach (var (slot, m) in _activeModules ?? [])
         {
             var values = Presets.BoundSafeAt(slot)?.ActiveStrategyOverrides(m.DataIndex) ?? Planner?.ActiveStrategyOverrides(m.DataIndex, WorldState, PlayerSlot) ?? throw new InvalidOperationException("Both preset and plan are null, but there are active modules");
+            var firstGoal = Hints.GoalZones.Count;
             m.Module.Execute(values, ref target, estimatedAnimLockDelay, isMoving);
+            // Preserve explicit semantic tags; identify remaining direct GoalZones.Add contributors.
+            string? owner = null;
+            for (var i = firstGoal; i < Hints.GoalZones.Count; ++i)
+                if (!Hints.GoalZoneOwners.Any(tag => tag.goalIndex == i))
+                    Hints.GoalZoneOwners.Add((i, owner ??= m.Module.GoalDiagnosticOwner("unlabelled/primary-target-context", target)));
         }
     }
 
@@ -200,6 +239,7 @@ public sealed class RotationModuleManager : IDisposable
 
     public void Activate(Preset p, bool exclusive = false)
     {
+        var invalidated = InvalidateCompletionSuppression("preset activation");
         var dirty = Presets.Remove(ForceDisable);
         if (exclusive)
             Presets.Clear();
@@ -208,14 +248,15 @@ public sealed class RotationModuleManager : IDisposable
             Presets.Add(p);
             dirty = true;
         }
-        if (dirty)
+        if (dirty || invalidated)
             ++PresetSelectionVersion;
         DirtyActiveModules(dirty);
     }
 
     public void Deactivate(Preset p)
     {
-        if (Presets.Remove(p))
+        var invalidated = InvalidateCompletionSuppression("preset deactivation");
+        if (Presets.Remove(p) || invalidated)
         {
             ++PresetSelectionVersion;
             DirtyActiveModules(true);
@@ -224,6 +265,7 @@ public sealed class RotationModuleManager : IDisposable
 
     public void Toggle(Preset p, bool exclusive = false)
     {
+        var invalidated = InvalidateCompletionSuppression("preset toggle");
         var previous = Presets.ToArray();
         if (!Presets.Remove(p))
         {
@@ -234,26 +276,29 @@ public sealed class RotationModuleManager : IDisposable
         if (p != ForceDisable)
             Presets.Remove(ForceDisable);
         var changed = !previous.SequenceEqual(Presets);
-        if (changed)
+        if (changed || invalidated)
             ++PresetSelectionVersion;
         DirtyActiveModules(true);
     }
 
     public void Clear()
     {
+        var invalidated = InvalidateCompletionSuppression("preset clear");
         var changed = Presets.Count > 0;
         Presets.Clear();
-        if (changed)
+        if (changed || invalidated)
             ++PresetSelectionVersion;
         DirtyActiveModules(true);
     }
 
     public void SetForceDisabled()
     {
+        // A new manual/safety disable overrides completion ownership even if already disabled.
+        var invalidated = InvalidateCompletionSuppression("new manual/safety force-disable");
         var changed = Presets.Count != 1 || Presets[0] != ForceDisable;
         Presets.Clear();
         Presets.Add(ForceDisable);
-        if (changed)
+        if (changed || invalidated)
             ++PresetSelectionVersion;
         DirtyActiveModules(true);
     }
@@ -357,11 +402,19 @@ public sealed class RotationModuleManager : IDisposable
 
         CombatStart = actor.InCombat ? WorldState.CurrentTime : default; // keep track of combat time in case rotation modules want to do something special in openers
 
-        if (!actor.InCombat && (IsForceDisabled ? Config.ClearForceDisableOnCombatEnd : Config.ClearPresetOnCombatEnd))
+        if (!actor.InCombat)
         {
-            // player exits combat => clear manual overrides
-            Service.Log($"[RMM] Player exits combat => clear presets '{PresetNames}'");
-            Clear();
+            if (_completionSuppression.ShouldClearOnCombatEnd(false, IsForceDisabled,
+                Config.ClearPresetOnCombatEnd, Config.ClearForceDisableOnCombatEnd, PresetSelectionVersion))
+            {
+                // player exits combat => clear manual overrides, unless this is our owned completion hold
+                Service.Log($"[RMM] Player exits combat => clear presets '{PresetNames}'");
+                Clear();
+            }
+            else if (Config.ClearForceDisableOnCombatEnd && OwnsDeepDungeonCompletionSuppression(_completionSuppression.Token))
+            {
+                Service.Log("[RMM] Player exits combat => preserving AutoDD-owned completion suppression for departure/continuation");
+            }
         }
         else if (actor.InCombat && WorldState.Client.CountdownRemaining > Config.EarlyPullThreshold)
         {

@@ -96,6 +96,13 @@ abstract partial class AutoClear : ZoneModule
     private int _fullClearRevealWaitRoom;
     private DateTime _fullClearRevealWaitStarted;
     private bool _fullClearRevealStallLogged;
+    private readonly DeepDungeonRoomRejoinPolicy _roomRejoin = new();
+    private bool _roomRejoinOwnsFrame;
+    private bool _roomRejoinHolding;
+    private WPos _roomRejoinHoldAnchor;
+    private long _roomRejoinLoggedGeneration;
+    private string? _roomRejoinNotificationContext;
+    private bool _roomRejoinFailureNotified;
 
     private void PickARoom(Actor player, AIHints hints)
     {
@@ -185,19 +192,34 @@ abstract partial class AutoClear : ZoneModule
             SetDesiredRoom(destination, destinationCause);
     }
 
-    private void HandleFloorPathfind(Actor player, AIHints hints)
+    private string? RoomRejoinContext => DesiredRoom.Reason != PathfindReason.Nothing
+        && DesiredRoom.Index is >= 0 and < 25 && Palace.Rooms[DesiredRoom.Index] != RoomFlags.None
+            ? $"{Palace.DungeonId}/{Palace.Floor}/{World.CurrentZone}/{DesiredRoom.Index}/{DesiredRoom.Reason}" : null;
+
+    private void HandleFloorPathfind(Actor player, AIHints hints, DeepDungeonRoomRejoinPolicy.NavigationOwner owner)
     {
+        if (World.DeepDungeon.RoomRejoinRetryRequested)
+        {
+            World.DeepDungeon.RoomRejoinRetryRequested = false;
+            ResetRoomRejoin();
+        }
         if (DesiredRoom.Reason == PathfindReason.Nothing)
             return;
+        if (owner == DeepDungeonRoomRejoinPolicy.NavigationOwner.Manual)
+            ResetRoomRejoin();
+        else
+            _roomRejoin.Bind(RoomRejoinContext);
 
         if (!TryGetCurrentRoomRects(out var rects, out var geometryReason))
         {
             LogNoPathState($"geometry:{geometryReason}", $"room navigation unavailable: {geometryReason}");
+            _roomRejoin.Pause(Environment.TickCount64);
             return;
         }
         if (DesiredRoom.Index is < 0 or >= 25 || Palace.Rooms[DesiredRoom.Index] == RoomFlags.None || !ValidRoomBox(rects[DesiredRoom.Index]))
         {
             LogNoPathState($"destination:{DesiredRoom.Index}", $"invalid destination room {DesiredRoom.Index}");
+            ResetRoomRejoin();
             return;
         }
 
@@ -208,6 +230,7 @@ abstract partial class AutoClear : ZoneModule
         var destRoom = rects[DesiredRoom.Index];
         if (destRoom.Contains(player.Position))
         {
+            ResetRoomRejoin(); // actual destination-room entry supersedes any intermediate rejoin
             var roomFlags = Palace.Rooms[DesiredRoom.Index];
             var fullClearPending = !DeepDungeonPolicy.ShouldClearReachedRoomDestination(
                 DesiredRoom.Reason == PathfindReason.Everything,
@@ -233,7 +256,8 @@ abstract partial class AutoClear : ZoneModule
                 // Crossing the room bounds does not prove the map reveal has arrived. Keep this
                 // objective and gently move toward the interior while waiting for authoritative map state.
                 var roomCenter = destRoom.Pos;
-                hints.AddGoalZone(p => p.InCircle(roomCenter, 3) ? 0.02f : 0, $"deepdungeon-fullclear-interior:{DesiredRoom.Index}");
+                AddRoomNavigationGoal(hints, owner, p => p.InCircle(roomCenter, 3) ? 0.02f : 0,
+                    $"deepdungeon-fullclear-interior:{DesiredRoom.Index}", $"{RoomRejoinContext}/interior");
                 return;
             }
 
@@ -243,12 +267,19 @@ abstract partial class AutoClear : ZoneModule
         }
 
         var goalWeight = player.InCombat ? 1 : 0.01f;
-
+        var manualMovement = DeepDungeonPartyPolicy.RecentManualMovement(hints.DeepDungeonCoordinationManualAt, World.CurrentTime);
+        var suspendedRejoin = manualMovement || player.InCombat || player.CastInfo != null || !Utils.IsScreenReady()
+            || hints.ForcedMovement != null || player.PendingKnockbacks.Count > 0 || World.Client.Flying
+            || hints.InteractWithTarget != null || hints.InteractWithRawTarget != null
+            || Service.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedInQuestEvent];
         // player is in a hallway/bridge near destination room, move closer
         if (PlayerRoom == DesiredRoom.Index)
         {
+            _roomRejoin.Pause(Environment.TickCount64);
             LogNoPathState(null, "path available");
-            hints.AddGoalZone(p => p.InRect(destRoom.Pos, default(Angle), destRoom.Scale.Z, destRoom.Scale.Z, destRoom.Scale.X) ? goalWeight : 0, $"deepdungeon-room:{DesiredRoom.Index}:{ReasonReadable(DesiredRoom.Reason)}");
+            AddRoomNavigationGoal(hints, owner,
+                p => p.InRect(destRoom.Pos, default(Angle), destRoom.Scale.Z, destRoom.Scale.Z, destRoom.Scale.X) ? goalWeight : 0,
+                $"deepdungeon-room:{DesiredRoom.Index}:{ReasonReadable(DesiredRoom.Reason)}", $"{RoomRejoinContext}/final-approach");
             return;
         }
 
@@ -256,6 +287,7 @@ abstract partial class AutoClear : ZoneModule
         if (path.Count == 0)
         {
             LogNoPathState($"{PlayerRoom}:{DesiredRoom.Index}", $"no path from room {PlayerRoom} to {DesiredRoom.Index} ({ReasonReadable(DesiredRoom.Reason)})");
+            _roomRejoin.Pause(Environment.TickCount64);
             return;
         }
         LogNoPathState(null, "path available");
@@ -272,8 +304,103 @@ abstract partial class AutoClear : ZoneModule
         var playerProgress = (playerPos - srcBox.Pos).Dot(routeDirection);
         var rectWidth = 10f;
 
-        hints.AddGoalZone(p => DeepDungeonPolicy.ForwardRoomRoutePriority(p, srcBox.Pos, destBox.Pos, playerProgress, rectWidth, goalWeight),
-            $"deepdungeon-route:{PlayerRoom}->{DesiredRoom.Index}:{ReasonReadable(DesiredRoom.Reason)}:via={string.Join(">", path)}:src={srcBox.Room}@({srcBox.Pos.X:F1},{srcBox.Pos.Z:F1})±({srcBox.Scale.X:F1},{srcBox.Scale.Z:F1}):next={destBox.Room}@({destBox.Pos.X:F1},{destBox.Pos.Z:F1})±({destBox.Scale.X:F1},{destBox.Scale.Z:F1}):corridor=forward-progress[{playerProgress:F1},{srcToDestLen:F1}],halfWidth={rectWidth:F1}");
+        var routeKey = $"{RoomRejoinContext}/segment:{PlayerRoom}>{path[0]}";
+        var now = Environment.TickCount64;
+        var feedback = hints.DeepDungeonRoomRouteResult;
+        var routeFailed = DeepDungeonRoomRejoinPolicy.FreshFailedRoute(routeKey, feedback.Key, now, feedback.At, feedback.Failed);
+        var rejoinOwns = _roomRejoin.Step(now, RoomRejoinContext, owner, !suspendedRejoin, routeFailed,
+            playerPos, srcBox.Pos, srcBox.Size, destBox.Pos, destBox.Size);
+        if (rejoinOwns)
+        {
+            if (ApplyRoomRejoinGoals(player, hints, false, manualMovement, goalWeight))
+                return;
+        }
+        else
+            World.DeepDungeon.RoomRejoinStatus = _roomRejoin.Attempts == 0 ? null
+                : owner != DeepDungeonRoomRejoinPolicy.NavigationOwner.RoomRoute || suspendedRejoin
+                    ? "Room-route recovery paused for another owner; budget retained"
+                    : "Rejoined corridor; verifying room-route progress, budget retained";
+
+        AddRoomNavigationGoal(hints, owner,
+            p => DeepDungeonPolicy.ForwardRoomRoutePriority(p, srcBox.Pos, destBox.Pos, playerProgress, rectWidth, goalWeight),
+            $"deepdungeon-route:{PlayerRoom}->{DesiredRoom.Index}:{ReasonReadable(DesiredRoom.Reason)}:via={string.Join(">", path)}:src={srcBox.Room}@({srcBox.Pos.X:F1},{srcBox.Pos.Z:F1})±({srcBox.Scale.X:F1},{srcBox.Scale.Z:F1}):next={destBox.Room}@({destBox.Pos.X:F1},{destBox.Pos.Z:F1})±({destBox.Scale.X:F1},{destBox.Scale.Z:F1}):corridor=forward-progress[{playerProgress:F1},{srcToDestLen:F1}],halfWidth={rectWidth:F1}", routeKey);
+    }
+
+    private void AddRoomNavigationGoal(AIHints hints, DeepDungeonRoomRejoinPolicy.NavigationOwner owner,
+        Func<WPos, float> goal, string diagnosticOwner, string routeKey)
+    {
+        // Even weaker room attraction adds to actor priority. At a room boundary this can
+        // alternate winning endpoints while the actor itself stays selected. One owner, one objective.
+        if (!DeepDungeonRoomRejoinPolicy.AllowsRoomGoal(owner))
+            return;
+        hints.AddGoalZone(goal, diagnosticOwner);
+        hints.DeepDungeonPartyNavigationKey = AutoNavigationKey($"{owner}:{routeKey}");
+        if (owner == DeepDungeonRoomRejoinPolicy.NavigationOwner.RoomRoute)
+        {
+            hints.DeepDungeonRoomRouteKey = routeKey;
+            hints.DeepDungeonRoomRouteGoal = goal;
+        }
+    }
+
+    private void ResetRoomRejoin()
+    {
+        _roomRejoin.Reset();
+        _roomRejoinOwnsFrame = _roomRejoinHolding = _roomRejoinFailureNotified = false;
+        World.DeepDungeon.RoomRejoinStatus = null;
+    }
+
+    private bool ApplyRoomRejoinGoals(Actor player, AIHints hints, bool suspended, bool manual, float weight)
+    {
+        if (_roomRejoinNotificationContext != _roomRejoin.Context || _roomRejoin.Attempts == 0)
+        {
+            _roomRejoinNotificationContext = _roomRejoin.Context;
+            _roomRejoinFailureNotified = false;
+        }
+        if (_roomRejoinLoggedGeneration != _roomRejoin.Generation)
+        {
+            _roomRejoinLoggedGeneration = _roomRejoin.Generation;
+            _roomRejoinHolding = false;
+            if (_roomRejoin.Attempts > 0)
+            {
+                var summary = $"room-route rejoin: context={_roomRejoin.Context},phase={_roomRejoin.State},attempt={_roomRejoin.Attempts}/3,anchor={_roomRejoin.Anchor},lateral={DeepDungeonRoomRejoinPolicy.LateralDistance(player.Position, _roomRejoin.Source, _roomRejoin.Next):F2},source={_roomRejoin.Source},next={_roomRejoin.Next}; room bounds are not traversability evidence";
+                hints.DeepDungeonDiagnosticRequest = summary;
+                Service.Log($"[AutoDD] {summary}.");
+            }
+        }
+        if (!_roomRejoin.OwnsNavigation)
+        {
+            World.DeepDungeon.RoomRejoinStatus = _roomRejoin.Attempts > 0 ? "Rejoined corridor; verifying forward progress, budget retained" : null;
+            return false;
+        }
+        _roomRejoinOwnsFrame = true;
+        hints.DeepDungeonPartyNavigationKey = PartyNavigationKey($"room-rejoin:{_roomRejoin.Context}:{_roomRejoin.Generation}:suspended:{suspended}");
+        if (_roomRejoin.State == DeepDungeonRoomRejoinPolicy.Phase.FailedHold || suspended)
+        {
+            if (!_roomRejoinHolding || manual)
+            {
+                _roomRejoinHolding = true;
+                _roomRejoinHoldAnchor = player.Position;
+            }
+            hints.AddGoalZone(AIHints.GoalSingleTarget(_roomRejoinHoldAnchor, 1, 1), "deepdungeon-room-rejoin-hold");
+            hints.DeepDungeonIntentionalHoldReason = _roomRejoin.State == DeepDungeonRoomRejoinPolicy.Phase.FailedHold
+                ? $"room-route rejoin failed; context={_roomRejoin.Context},attempts={_roomRejoin.Attempts}/3; bounded recovery stopped"
+                : "room-route rejoin suspended for manual input, combat, casting, readiness, or forced movement";
+        }
+        else
+        {
+            _roomRejoinHolding = false;
+            hints.AddGoalZone(DeepDungeonRoomRejoinPolicy.RejoinGoal(player.Position, _roomRejoin.Anchor, weight),
+                $"deepdungeon-room-rejoin:{DesiredRoom.Index}:attempt:{_roomRejoin.Attempts}");
+        }
+        World.DeepDungeon.RoomRejoinStatus = _roomRejoin.State == DeepDungeonRoomRejoinPolicy.Phase.FailedHold
+            ? "STOPPED: corridor re-entry failed; move safely into the route or explicitly retry"
+            : suspended ? "Corridor re-entry suspended; budget retained" : $"Rejoining corridor; attempt {_roomRejoin.Attempts}/3";
+        if (_roomRejoin.State == DeepDungeonRoomRejoinPolicy.Phase.FailedHold && !_roomRejoinFailureNotified)
+        {
+            _roomRejoinFailureNotified = true;
+            Service.ChatMessage($"AutoDD: room {DesiredRoom.Index} corridor re-entry failed; holding. Use manual movement or Retry room-route recovery.");
+        }
+        return true;
     }
 
     private void LogNoPathState(string? state, string message)

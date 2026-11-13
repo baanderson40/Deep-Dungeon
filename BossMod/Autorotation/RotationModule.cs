@@ -206,6 +206,8 @@ public abstract class RotationModule(RotationModuleManager manager, Actor player
     public BossModuleManager Bossmods => Manager.Bossmods;
     public WorldState World => Manager.Bossmods.WorldState;
     public AIHints Hints => Manager.Hints;
+    protected internal string GoalDiagnosticOwner(string kind, Actor? target, float? range = null)
+        => $"rotation:{GetType().Name}:{kind}/target:{target?.InstanceID.ToString("X") ?? "none"}/targetCombat:{target?.InCombat}/aggroPlayer:{target?.AggroPlayer}/targetOfTarget:{target?.TargetID.ToString("X") ?? "none"}/priority:{(target != null ? Hints.FindEnemy(target)?.Priority : null)}/range:{range}";
 
     // the main entry point of the module - given a set of strategy values, fill the queue with a set of actions to execute
     public abstract void Execute(StrategyValues strategy, ref Actor? primaryTarget, float estimatedAnimLockDelay, bool isMoving);

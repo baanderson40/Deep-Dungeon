@@ -365,7 +365,7 @@ public abstract class Basexan<AID, TraitID, TValues>(RotationModuleManager manag
     protected void GoalZoneSingle(float range)
     {
         if (PlayerTarget != null)
-            Hints.GoalZones.Add(Hints.GoalSingleTarget(PlayerTarget.Actor, Player, World.Actors, range));
+            Hints.AddGoalZone(Hints.GoalSingleTarget(PlayerTarget.Actor, Player, World.Actors, range), GoalDiagnosticOwner("single-range", PlayerTarget.Actor, range));
     }
 
     protected void GoalZoneCombined(in IStrategyCommon strategy, float range, Func<WPos, float> fAoe, AID firstUnlockedAoeAction, int minAoe, float? maximumActionRange = null)
@@ -379,13 +379,13 @@ public abstract class Basexan<AID, TraitID, TValues>(RotationModuleManager manag
         if (PlayerTarget == null)
         {
             if (minAoe < 50)
-                Hints.GoalZones.Add(fAoe);
+                Hints.AddGoalZone(fAoe, GoalDiagnosticOwner("aoe", null, range));
         }
         else
         {
-            Hints.GoalZones.Add(GoalCombined(Hints.GoalSingleTarget(PlayerTarget.Actor, imminent ? positional : Positional.Any, Player, World.Actors, range), fAoe, minAoe));
+            Hints.AddGoalZone(GoalCombined(Hints.GoalSingleTarget(PlayerTarget.Actor, imminent ? positional : Positional.Any, Player, World.Actors, range), fAoe, minAoe), GoalDiagnosticOwner($"combined/positional:{(imminent ? positional : Positional.Any)}", PlayerTarget.Actor, range));
             if (maximumActionRange is float r)
-                Hints.GoalZones.Add(Hints.GoalSingleTarget(PlayerTarget.Actor, Player, World.Actors, r, 0.5f));
+                Hints.AddGoalZone(Hints.GoalSingleTarget(PlayerTarget.Actor, Player, World.Actors, r, 0.5f), GoalDiagnosticOwner("maximum-action-range", PlayerTarget.Actor, r));
         }
     }
 

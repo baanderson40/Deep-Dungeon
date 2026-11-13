@@ -7,6 +7,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "BossMod", "BossMod\BossMod.
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "CodeAnalysis", "CodeAnalysis\CodeAnalysis.csproj", "{F5F7E565-DCF2-494A-A18F-F7FA503428F5}"
 EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "CodeAnalysis.CodeFixes", "CodeAnalysis.CodeFixes\CodeAnalysis.CodeFixes.csproj", "{26F06419-1B54-4EE8-9500-B758E6976822}"
+EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{83DEBDD2-29E9-4087-8FBD-092B458D2F7D}"
 	ProjectSection(SolutionItems) = preProject
 		.editorconfig = .editorconfig
@@ -51,6 +53,10 @@ Global
 		{F5F7E565-DCF2-494A-A18F-F7FA503428F5}.Debug|AnyCPU.Build.0 = Debug|Any CPU
 		{F5F7E565-DCF2-494A-A18F-F7FA503428F5}.Release|AnyCPU.ActiveCfg = Release|Any CPU
 		{F5F7E565-DCF2-494A-A18F-F7FA503428F5}.Release|AnyCPU.Build.0 = Release|Any CPU
+		{26F06419-1B54-4EE8-9500-B758E6976822}.Debug|AnyCPU.ActiveCfg = Debug|Any CPU
+		{26F06419-1B54-4EE8-9500-B758E6976822}.Debug|AnyCPU.Build.0 = Debug|Any CPU
+		{26F06419-1B54-4EE8-9500-B758E6976822}.Release|AnyCPU.ActiveCfg = Release|Any CPU
+		{26F06419-1B54-4EE8-9500-B758E6976822}.Release|AnyCPU.Build.0 = Release|Any CPU
 		{A8D1E505-DA3A-4F19-9831-F745718AD97C}.Debug|AnyCPU.ActiveCfg = Debug|x64
 		{A8D1E505-DA3A-4F19-9831-F745718AD97C}.Release|AnyCPU.ActiveCfg = Release|x64
 		{A8D1E505-DA3A-4F19-9831-F745718AD97C}.Release|AnyCPU.Build.0 = Release|x64

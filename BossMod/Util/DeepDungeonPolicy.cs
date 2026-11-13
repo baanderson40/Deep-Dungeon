@@ -11,6 +11,8 @@ internal static class DeepDungeonPolicy
         CastingHold,
         BossFloorIdle,
         NoNavigationDestination,
+        IntentionalCoordinationHold,
+        NavigationSnapshot,
     }
 
     internal struct FloorInitializationGate
@@ -336,7 +338,11 @@ internal static class DeepDungeonPolicy
 
         var routeLength = (nextRoom - source).Length();
         var progress = (point - source).Dot((nextRoom - source) / routeLength);
-        return maxPriority * (0.5f + 0.5f * Math.Clamp(progress / routeLength, 0, 1));
+        // Normalize from the captured player projection, not source-room zero. Otherwise every
+        // local cell behind the source center has identical priority and a nearby endpoint wins.
+        var remaining = routeLength - startProgress;
+        var fraction = remaining > 0.01f ? Math.Clamp((progress - startProgress) / remaining, 0, 1) : 1;
+        return maxPriority * (0.5f + 0.5f * fraction);
     }
 
     internal static bool ShouldKeepFullClearDestination(bool fullClearEnabled, bool roomActive, bool roomRevealed)
@@ -353,7 +359,7 @@ internal static class DeepDungeonPolicy
 
     internal static readonly TimeSpan FloorStartPomanderWindow = TimeSpan.FromSeconds(45);
     internal static readonly TimeSpan TreasureRecoveryCooldown = TimeSpan.FromSeconds(60);
-    internal static readonly TimeSpan TreasureStallThreshold = TimeSpan.FromSeconds(30);
+    internal static readonly TimeSpan TreasureStallThreshold = TimeSpan.FromSeconds(15);
     internal static readonly TimeSpan TreasureStallDiagnosticThreshold = TimeSpan.FromSeconds(10);
     internal static readonly TimeSpan TreasureOscillationThreshold = TimeSpan.FromSeconds(15);
     internal static readonly TimeSpan TreasureSelectionContinuity = TimeSpan.FromMilliseconds(250);
@@ -465,6 +471,32 @@ internal static class DeepDungeonPolicy
     internal static bool ShouldAddPassageActorGoal(bool hasRoomDestination, bool headingToPassage, bool hasManualDestination)
         => !hasManualDestination && (!hasRoomDestination || headingToPassage);
 
+    // Admission requires adjacency once; room-boundary jitter must not retire a selected actor.
+    // This retains identity only, never permission to move or bypass navigation ownership.
+    internal struct PassageSelection
+    {
+        private string? _context;
+        internal ulong ActorId { get; private set; }
+
+        internal readonly bool CanRetain(string context, ulong actorId)
+            => actorId != 0 && ActorId == actorId && _context == context;
+
+        internal readonly bool CanAdmit(string context, ulong actorId, bool adjacent, bool eligible)
+            => actorId != 0 && eligible && (adjacent || CanRetain(context, actorId));
+
+        internal void Select(string context, ulong selectedActorId)
+        {
+            _context = selectedActorId != 0 ? context : null;
+            ActorId = selectedActorId;
+        }
+    }
+
+    // Distant passage approach from 06dee0844. Local party assembly is a separate goal set.
+    internal static (Func<WPos, float> Arrival, Func<WPos, float> Approach, Func<WPos, float> Progress)
+        PassageApproachGoals(WPos target, WPos player, float weight)
+        => (AIHints.GoalSingleTarget(target, 2, weight), AIHints.GoalSingleTarget(target, 25, weight),
+            PassageProgressGoal(target, player, 25, 100, 1, weight));
+
     internal static Func<WPos, float> PassageProgressGoal(WPos target, WPos player, float preferredRange, float maxRange, float minProgress, float weight)
     {
         var playerDistance = (target - player).Length();
@@ -493,8 +525,10 @@ internal static class DeepDungeonPolicy
     internal static bool ShouldLogStall(TimeSpan noProgressFor, DateTime lastLog, DateTime now)
         => noProgressFor >= TimeSpan.FromSeconds(10) && (lastLog == default || now - lastLog >= TimeSpan.FromSeconds(30));
 
-    internal static MovementDiagnosticKind ClassifyMovementDiagnostic(bool oscillating, bool bossFloor, bool interactionSuppressed, bool castingSuppressed, bool inCombat, bool hasDestination, bool movementIssued, float? goalHere, float? goalDestination)
+    internal static MovementDiagnosticKind ClassifyMovementDiagnostic(bool oscillating, bool bossFloor, bool interactionSuppressed, bool castingSuppressed, bool inCombat, bool hasDestination, bool movementIssued, float? goalHere, float? goalDestination, bool intentionalHold = false, bool diagnosticSnapshot = false)
     {
+        if (intentionalHold && !movementIssued && !interactionSuppressed && !castingSuppressed)
+            return MovementDiagnosticKind.IntentionalCoordinationHold;
         if (oscillating)
             return MovementDiagnosticKind.NavigationOscillation;
         if (interactionSuppressed)
@@ -505,6 +539,8 @@ internal static class DeepDungeonPolicy
             return MovementDiagnosticKind.CombatPositioningSatisfied;
         if (!movementIssued && bossFloor && !hasDestination)
             return MovementDiagnosticKind.BossFloorIdle;
+        if (diagnosticSnapshot)
+            return MovementDiagnosticKind.NavigationSnapshot;
         return hasDestination ? MovementDiagnosticKind.NavigationStall : MovementDiagnosticKind.NoNavigationDestination;
     }
 

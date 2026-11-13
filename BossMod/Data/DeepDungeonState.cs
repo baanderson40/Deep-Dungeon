@@ -7,6 +7,9 @@ public sealed class DeepDungeonState
     // Runtime completion latch set only after a supported boss was observed alive and then dead.
     // Intentionally retained while Deep Dungeon state clears during the leave transition.
     public bool BossCompletionObserved { get; internal set; }
+    // Runtime-only status; never used to authorize an interaction or reconstruct a run after reload.
+    public string? ContinuationStatus { get; internal set; }
+    public bool ContinuationRetryRequested;
 
     public enum DungeonType : byte
     {
@@ -41,6 +44,11 @@ public sealed class DeepDungeonState
     public readonly Chest[] Chests = new Chest[NumChests];
     public readonly byte[] Magicite = new byte[NumMagicites];
     public FloorEffects FloorEffectsSnapshot;
+    // Local runtime coordination UI, not serialized game state.
+    public string? PartyCoordinationStatus;
+    public bool PartyCoordinationRetryRequested;
+    public string? RoomRejoinStatus;
+    public bool RoomRejoinRetryRequested;
 
     public bool ReturnActive => Progress.ReturnProgress >= 11;
     public bool PassageActive => Progress.PassageProgress >= 11;

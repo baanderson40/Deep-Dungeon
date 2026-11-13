@@ -41,7 +41,7 @@ public sealed class ModulePackService(IDalamudPluginInterface dalamud, IPluginLo
     private readonly Dictionary<string, LoadContext> _loadContexts = [];
     private readonly SensibleFileWatcher _watcher = new(filter: "*.dll", includeSubdirectories: true);
     private readonly EventSubscriptions _modified = new();
-    public readonly string ModuleDir = Path.Join(Plugin.GetStorageDir(), dalamud.IsDev ? "modules-dev" : "modules");
+    public readonly string ModuleDir = ModuleDeployment.SelectModuleDirectory(dalamud.IsDev, dalamud.AssemblyLocation.DirectoryName!, Plugin.GetStorageDir(), File.Exists);
 
     public IEnumerable<Assembly> Loaded => _loadContexts.Values.SelectMany(c => c.Assemblies);
 
@@ -50,7 +50,11 @@ public sealed class ModulePackService(IDalamudPluginInterface dalamud, IPluginLo
 
     async Task IHostedService.StartAsync(CancellationToken cancellationToken)
     {
-        InstallLibraries(dalamud.AssemblyLocation);
+        // Portable dev modules are built in place, not installed through the version-only cache.
+        if (!dalamud.IsDev || ModuleDir != Path.Join(dalamud.AssemblyLocation.DirectoryName!, "modules-dev"))
+            InstallLibraries(dalamud.AssemblyLocation);
+
+        logger.Info($"[Modules] Loading {(dalamud.IsDev ? "development" : "release")} modules from {ModuleDir}");
 
         ReloadFrom(ModuleDir);
 

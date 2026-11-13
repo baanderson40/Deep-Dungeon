@@ -18,12 +18,26 @@ public struct NavigationDecision
         public BitArray ScratchD = new(0);
         public Map Map = new();
         public ThetaStar ThetaStar = new();
+        public Context? PotentialTrapComparison;
     }
 
     public WPos? Destination;
     public WPos? NextWaypoint;
     public WPos? PathfindDestination;
     public WPos? SearchGoalPosition;
+    public bool HasCoordinationGoal;
+    public bool CoordinationGoalSatisfied;
+    public string? RoomRouteKey;
+    public bool RoomRouteFailed;
+    public string? PotentialTrapObjectiveKey;
+    public bool PotentialTrapGoalReached;
+    public bool PotentialTrapCrossing;
+    public sealed class PotentialTrapAlternative(NavigationDecision decision, WPos[] route)
+    {
+        public NavigationDecision Decision = decision;
+        public readonly WPos[] Route = route;
+    }
+    public PotentialTrapAlternative? PotentialTrapRoute;
     public WPos PathfindMapCenter;
     public WDir PathfindMapLocalZDivRes;
     public float PathfindMapResolution;
@@ -67,6 +81,23 @@ public struct NavigationDecision
     public double DiagnosticDurationMs;
     public DateTime BuildCompletedAt;
     public DateTime DiagnosticCompletedAt;
+    public long RequestedAtMilliseconds;
+    public long BuildStartedAtMilliseconds;
+    public long BuildCompletedAtMilliseconds;
+    public long ConsumedAtMilliseconds;
+    public string? RequestContext;
+
+    internal readonly record struct RequestStamp(long RequestedTick, string? Context)
+    {
+        internal NavigationDecision Complete(NavigationDecision decision, long startedTick, long completedTick)
+        {
+            decision.RequestedAtMilliseconds = RequestedTick;
+            decision.BuildStartedAtMilliseconds = startedTick;
+            decision.BuildCompletedAtMilliseconds = completedTick;
+            decision.RequestContext = Context;
+            return decision;
+        }
+    }
 
     public const float CushionDepriority = 0.5f; // should be lower than any priority specifically added by rotation modules
 
@@ -78,17 +109,18 @@ public struct NavigationDecision
     //  - sending position update packet (not an option, can't be done in the vanilla client, so it doesn't match our philosophy)
     public static float CushionFromRTT(float rtt) => rtt + 0.5f + ActorCastInfo.NPCFinishDelay;
 
-    public static NavigationDecision Build(Context ctx, DateTime currentTime, AIHints hints, WPos playerPosition, float playerSpeed, float rtt, float spaceCushion, bool useOldRasterizer = false, bool collectDiagnostics = false, long sequence = 0, float requestedHeightY = 0, WPos? comparisonGoal = null)
+    public static NavigationDecision Build(Context ctx, DateTime currentTime, AIHints hints, WPos playerPosition, float playerSpeed, float rtt, float spaceCushion, bool useOldRasterizer = false, bool collectDiagnostics = false, long sequence = 0, float requestedHeightY = 0, WPos? comparisonGoal = null, bool omitPotentialTraps = false)
     {
         var startTime = DateTime.Now;
 
         hints.InitPathfindMap(ctx.Map);
-        if (hints.ForbiddenZones.Count > 0)
+        var forbidden = PotentialTrapZonesForSolve(hints.ForbiddenZones, omitPotentialTraps);
+        if (forbidden.Count > 0)
         {
             if (useOldRasterizer)
-                RasterizeForbiddenZonesOld(ctx.Map, hints.ForbiddenZones, currentTime, ctx.ScratchG, ctx.ScratchD, rtt, spaceCushion);
+                RasterizeForbiddenZonesOld(ctx.Map, forbidden, currentTime, ctx.ScratchG, ctx.ScratchD, rtt, spaceCushion);
             else
-                RasterizeForbiddenZones(ctx.Map, playerPosition, hints.ForbiddenZones, currentTime, ctx.ScratchG, ctx.ScratchD, rtt, spaceCushion);
+                RasterizeForbiddenZones(ctx.Map, playerPosition, forbidden, currentTime, ctx.ScratchG, ctx.ScratchD, rtt, spaceCushion);
         }
 
         var emergencyMode = false;
@@ -110,13 +142,145 @@ public struct NavigationDecision
         var waypoints = GetFirstWaypoints(ctx.ThetaStar, bestNodeIndex);
         var finishTime = DateTime.Now;
         var searchGoalPosition = ctx.ThetaStar.CellCenter(bestNodeIndex);
-        var diagnostic = collectDiagnostics ? BuildPathfindDiagnostic(ctx, hints, playerPosition, requestedHeightY, waypoints.first, searchGoalPosition, comparisonGoal, currentTime, emergencyMode, bestNodeIndex) : null;
+        var diagnostic = collectDiagnostics ? BuildPathfindDiagnostic(ctx, hints, playerPosition, requestedHeightY, waypoints.first, searchGoalPosition, comparisonGoal, currentTime, emergencyMode, bestNodeIndex, forbidden) : null;
         var diagnosticFinish = DateTime.Now;
-        return new NavigationDecision() { Destination = waypoints.first, NextWaypoint = waypoints.second, PathfindDestination = waypoints.first, SearchGoalPosition = searchGoalPosition, PathfindMapCenter = ctx.Map.Center, PathfindMapLocalZDivRes = ctx.Map.LocalZDivRes, PathfindMapResolution = ctx.Map.Resolution, PathfindMapWidth = ctx.Map.Width, PathfindMapHeight = ctx.Map.Height, LeewaySeconds = bestNode.PathLeeway, TimeToGoal = bestNode.GScore, PathfindTime = finishTime - rasterFinish, RasterizeTime = rasterFinish - startTime, TotalTime = finishTime - startTime, PathfindDiagnostic = diagnostic, PathfindDiagnosticAt = collectDiagnostics ? currentTime : default, Sequence = sequence, RequestedAt = currentTime, RequestedPosition = playerPosition, RequestedHeightY = requestedHeightY, BuildDurationMs = (finishTime - startTime).TotalMilliseconds, DiagnosticDurationMs = (diagnosticFinish - finishTime).TotalMilliseconds, BuildCompletedAt = finishTime, DiagnosticCompletedAt = diagnosticFinish };
+        var decision = new NavigationDecision()
+        {
+            Destination = waypoints.first,
+            NextWaypoint = waypoints.second,
+            PathfindDestination = waypoints.first,
+            SearchGoalPosition = searchGoalPosition,
+            PathfindMapCenter = ctx.Map.Center,
+            PathfindMapLocalZDivRes = ctx.Map.LocalZDivRes,
+            PathfindMapResolution = ctx.Map.Resolution,
+            PathfindMapWidth = ctx.Map.Width,
+            PathfindMapHeight = ctx.Map.Height,
+            LeewaySeconds = bestNode.PathLeeway,
+            TimeToGoal = bestNode.GScore,
+            PathfindTime = finishTime - rasterFinish,
+            RasterizeTime = rasterFinish - startTime,
+            TotalTime = finishTime - startTime,
+            PathfindDiagnostic = diagnostic,
+            PathfindDiagnosticAt = collectDiagnostics ? currentTime : default,
+            Sequence = sequence,
+            RequestedAt = currentTime,
+            RequestedPosition = playerPosition,
+            RequestedHeightY = requestedHeightY,
+            BuildDurationMs = (finishTime - startTime).TotalMilliseconds,
+            DiagnosticDurationMs = (diagnosticFinish - finishTime).TotalMilliseconds,
+            BuildCompletedAt = finishTime,
+            DiagnosticCompletedAt = diagnosticFinish,
+        };
+        ValidateCoordinationGoal(ref decision, hints.DeepDungeonCoordinationGoal, hints.DeepDungeonCoordinationGoalRadius, emergencyMode);
+        if (hints.DeepDungeonRoomRouteKey != null && hints.DeepDungeonRoomRouteGoal is { } routeGoal)
+        {
+            decision.RoomRouteKey = hints.DeepDungeonRoomRouteKey;
+            decision.RoomRouteFailed = !emergencyMode && RoomRouteNeedsRecovery(decision, playerPosition, routeGoal);
+        }
+        decision.PotentialTrapObjectiveKey = hints.DeepDungeonPotentialTrapObjectiveKey;
+        if (hints.DeepDungeonPotentialTrapObjective is { } objective)
+        {
+            decision.PotentialTrapGoalReached = !emergencyMode && bestNode.Score == ThetaStar.Score.SafeMaxPrio
+                && objective(searchGoalPosition) > 0 && decision.LeewaySeconds == float.MaxValue
+                && (objective(playerPosition) > 0 || decision.Destination is { } normalDestination
+                    && !ReachedDestination((normalDestination - playerPosition).LengthSq(), decision.HasIntermediateWaypoint));
+            if (!omitPotentialTraps && hints.DeepDungeonPotentialTrapCrossingEligible && !decision.PotentialTrapGoalReached
+                && hints.DeepDungeonPotentialTrapDistance is { } prediction
+                && hints.ForbiddenZones.Any(z => z.tag == AIHints.DeepDungeonPotentialTrapTag))
+            {
+                var comparison = ctx.PotentialTrapComparison ??= new();
+                var alternative = Build(comparison, currentTime, hints, playerPosition, playerSpeed, rtt, spaceCushion,
+                    useOldRasterizer, collectDiagnostics, sequence, requestedHeightY, comparisonGoal, omitPotentialTraps: true);
+                var endpointIndex = comparison.ThetaStar.StartNodeIndex;
+                // Build's endpoint is a cell center, so recover its actual path score rather
+                // than treating visited/discovered goal cells as proof of a safe route.
+                if (alternative.SearchGoalPosition is { } endpoint)
+                    endpointIndex = comparison.Map.GridToIndex(comparison.Map.WorldToGrid(endpoint));
+                var alternativeEmergency = comparison.Map.PixelMaxG[comparison.ThetaStar.StartNodeIndex] == 0;
+                if (ValidPotentialTrapRoute(alternative, comparison.ThetaStar.NodeByIndex(endpointIndex).Score,
+                    alternativeEmergency, playerPosition, objective, prediction))
+                    decision.PotentialTrapRoute = new(alternative, PotentialTrapRoutePoints(comparison, endpointIndex, playerPosition));
+            }
+        }
+        return decision;
+    }
+
+    internal static bool ValidPotentialTrapRoute(NavigationDecision decision, ThetaStar.Score score, bool emergency,
+        WPos player, Func<WPos, float> objective, Func<WPos, float> prediction)
+        => !emergency && score == ThetaStar.Score.SafeMaxPrio && decision.LeewaySeconds == float.MaxValue
+            && decision.SearchGoalPosition is { } endpoint && objective(endpoint) > 0 && prediction(endpoint) >= 0.5f
+            && decision.Destination is { } destination && !ReachedDestination((destination - player).LengthSq(), decision.HasIntermediateWaypoint);
+
+    internal static List<(Sdf shape, DateTime activation, ulong tag)> PotentialTrapZonesForSolve(
+        List<(Sdf shape, DateTime activation, ulong tag)> zones, bool omitPotentialTraps)
+        => omitPotentialTraps ? zones.Where(z => z.tag != AIHints.DeepDungeonPotentialTrapTag).ToList() : zones;
+
+    private static WPos[] PotentialTrapRoutePoints(Context context, int index, WPos player)
+    {
+        var points = new List<WPos>();
+        for (var remaining = context.Map.Width * context.Map.Height; remaining > 0; --remaining)
+        {
+            if (index == context.ThetaStar.StartNodeIndex)
+            {
+                points.Add(player);
+                points.Reverse();
+                return [.. points];
+            }
+            points.Add(context.ThetaStar.NodePosition(index));
+            index = context.ThetaStar.NodeByIndex(index).ParentIndex;
+        }
+        return []; // malformed parent chains cannot authorize a crossing
+    }
+
+    internal static bool PotentialTrapPathStillClear(IReadOnlyList<WPos> route,
+        IReadOnlyList<(Sdf shape, DateTime activation, ulong tag)> zones, IReadOnlyList<Sdf> obstacles)
+    {
+        static bool Blocked(Sdf shape, WPos point)
+        {
+            var distance = shape.Distance(point);
+            return float.IsNaN(distance) || distance < 0.1f;
+        }
+        if (route.Count < 2)
+            return false;
+        for (int i = 1; i < route.Count; ++i)
+        {
+            var delta = route[i] - route[i - 1];
+            var length = delta.Length();
+            if (!float.IsFinite(length))
+                return false;
+            var steps = Math.Max(1, (int)MathF.Ceiling(length / 0.25f));
+            for (int step = 0; step <= steps; ++step)
+            {
+                var point = route[i - 1] + delta * ((float)step / steps);
+                // Recheck current hard zones too: a newly revealed trap or moving AOE must
+                // cancel an asynchronously prepared route. Future AOEs are not risk-relaxed.
+                if (zones.Any(z => z.tag != AIHints.DeepDungeonPotentialTrapTag && Blocked(z.shape, point))
+                    || obstacles.Any(o => Blocked(o, point)))
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    internal static bool RoomRouteNeedsRecovery(NavigationDecision decision, WPos player, Func<WPos, float> goal)
+        => decision.LeewaySeconds == float.MaxValue
+            && (decision.SearchGoalPosition is not { } endpoint || goal(endpoint) <= 0
+                || decision.Destination == null || ReachedDestination((decision.Destination.Value - player).LengthSq(), decision.HasIntermediateWaypoint));
+
+    internal static void ValidateCoordinationGoal(ref NavigationDecision decision, WPos? goal, float radius, bool emergencyMode)
+    {
+        // Emergency escape owns movement; it is not evidence that the requested probe is reachable.
+        decision.HasCoordinationGoal = goal != null && !emergencyMode;
+        decision.CoordinationGoalSatisfied = !decision.HasCoordinationGoal
+            || decision.SearchGoalPosition is { } endpoint && endpoint.InCircle(goal!.Value, radius)
+                && decision.LeewaySeconds == float.MaxValue;
+        if (!decision.CoordinationGoalSatisfied)
+            decision.Destination = decision.NextWaypoint = null;
     }
 
     public static Task<NavigationDecision> BuildAsync(Context ctx, DateTime currentTime, AIHints hints, WPos playerPos, float playerSpeed, float rtt, float spaceCushion, bool collectDiagnostics = false, long sequence = 0, float requestedHeightY = 0, WPos? comparisonGoal = null)
     {
+        var request = new RequestStamp(Environment.TickCount64, hints.NavigationRequestContext);
         var hintsCopy = new AIHints()
         {
             PathfindMapBounds = hints.PathfindMapBounds,
@@ -127,11 +291,28 @@ public struct NavigationDecision
             ForbiddenZones = [.. hints.ForbiddenZones],
             GoalZones = [.. hints.GoalZones],
             GoalZoneOwners = [.. hints.GoalZoneOwners],
+            NavigationRequestContext = hints.NavigationRequestContext,
+            DeepDungeonCoordinationGoal = hints.DeepDungeonCoordinationGoal,
+            DeepDungeonCoordinationGoalRadius = hints.DeepDungeonCoordinationGoalRadius,
+            DeepDungeonRoomRouteKey = hints.DeepDungeonRoomRouteKey,
+            DeepDungeonRoomRouteGoal = hints.DeepDungeonRoomRouteGoal,
+            DeepDungeonPotentialTrapDistance = hints.DeepDungeonPotentialTrapDistance,
+            DeepDungeonPotentialTrapObjectiveKey = hints.DeepDungeonPotentialTrapObjectiveKey,
+            DeepDungeonPotentialTrapObjective = hints.DeepDungeonPotentialTrapObjective,
+            DeepDungeonPotentialTrapCrossingEligible = hints.DeepDungeonPotentialTrapCrossingEligible,
         };
-        return Task.Run(() => Build(ctx, currentTime, hintsCopy, playerPos, playerSpeed, rtt, spaceCushion, collectDiagnostics: collectDiagnostics, sequence: sequence, requestedHeightY: requestedHeightY, comparisonGoal: comparisonGoal));
+        return Task.Run(() =>
+        {
+            var startedTick = Environment.TickCount64;
+            var result = Build(ctx, currentTime, hintsCopy, playerPos, playerSpeed, rtt, spaceCushion, collectDiagnostics: collectDiagnostics, sequence: sequence, requestedHeightY: requestedHeightY, comparisonGoal: comparisonGoal);
+            var completedTick = Environment.TickCount64;
+            if (result.PotentialTrapRoute is { } alternative)
+                alternative.Decision = request.Complete(alternative.Decision, startedTick, completedTick);
+            return request.Complete(result, startedTick, completedTick);
+        });
     }
 
-    private static string BuildPathfindDiagnostic(Context ctx, AIHints hints, WPos playerPosition, float playerHeightY, WPos? firstWaypoint, WPos searchGoalPosition, WPos? comparisonGoal, DateTime currentTime, bool emergencyMode, int bestNodeIndex)
+    private static string BuildPathfindDiagnostic(Context ctx, AIHints hints, WPos playerPosition, float playerHeightY, WPos? firstWaypoint, WPos searchGoalPosition, WPos? comparisonGoal, DateTime currentTime, bool emergencyMode, int bestNodeIndex, List<(Sdf shape, DateTime activation, ulong tag)> forbiddenZones)
     {
         var map = ctx.Map;
         var startGridRaw = map.WorldToGrid(playerPosition);
@@ -186,10 +367,10 @@ public struct NavigationDecision
             goalCoverage.Add($"{zoneIndex}/{Owner(zoneIndex)}:{covered}/{numPixels}@{maxScore:F2}/winner:{selectedScore:F3}/prior:{(comparisonGoal == null ? "n/a" : priorScore.ToString("F3"))}");
         }
 
-        var forbiddenCoverage = new List<string>(Math.Min(hints.ForbiddenZones.Count, 8));
-        for (var zoneIndex = 0; zoneIndex < Math.Min(hints.ForbiddenZones.Count, 8); ++zoneIndex)
+        var forbiddenCoverage = new List<string>(Math.Min(forbiddenZones.Count, 8));
+        for (var zoneIndex = 0; zoneIndex < Math.Min(forbiddenZones.Count, 8); ++zoneIndex)
         {
-            var zone = hints.ForbiddenZones[zoneIndex];
+            var zone = forbiddenZones[zoneIndex];
             var covered = 0;
             foreach (var (_, _, point) in map.EnumeratePixels())
                 if (zone.shape.Check(point))
@@ -201,9 +382,9 @@ public struct NavigationDecision
         var bestNode = ctx.ThetaStar.NodeByIndex(bestNodeIndex);
         var bestPos = ctx.ThetaStar.CellCenter(bestNodeIndex);
         var comparison = DescribeCandidateComparison(ctx, comparisonGoal, bestNodeIndex);
-        var segment = DescribeFirstSegment(map, hints, playerPosition, firstWaypoint, currentTime);
+        var segment = DescribeFirstSegment(map, hints, playerPosition, firstWaypoint, currentTime, forbiddenZones);
         static string FormatG(float g) => g == float.MaxValue ? "safe" : g == float.MinValue ? "blocked" : g.ToString("F2");
-        return $"pathTrace(at={currentTime:HH:mm:ss.fff},playerXZ=({playerPosition.X:F1},{playerPosition.Z:F1}),playerY={playerHeightY:F2},hints={hints.GoalZones.Count}goals/{hints.ForbiddenZones.Count}forbidden,map=center({map.Center.X:F1},{map.Center.Z:F1}),size={map.Width}x{map.Height}@{map.Resolution:F2},rotation={map.Rotation.Deg:F1},bounds={map.MinX}:{map.MinY}-{map.MaxX}:{map.MaxY},start=raw{startGridRaw}/inBounds:{startInBounds}/used{startGrid}/maxG:{FormatG(startMaxG)}/prio:{startPriority:F2},emergency={emergencyMode},constrained={blockedCells}/{numPixels},goalPixels={positivePriorityCells}/safe:{safePriorityCells}/maxPrio:{map.MaxPriority:F2},goalCoverage=[{string.Join(",", goalCoverage)}]{(hints.GoalZones.Count > goalCoverage.Count ? ",..." : "")},forbiddenCoverage=[{string.Join(",", forbiddenCoverage)}]{(hints.ForbiddenZones.Count > forbiddenCoverage.Count ? ",..." : "")},segment={segment},search(steps={ctx.ThetaStar.NumSteps},visitedGoals={visited.VisitedGoalCells}/{reachablePriorityCells},visitedMax={visited.VisitedMaxPriorityCells}/{reachableMaxPriorityCells},best=({bestGrid.x},{bestGrid.y})@({bestPos.X:F1},{bestPos.Z:F1}),score={bestNode.Score},g={bestNode.GScore:F2},h={bestNode.HScore:F2},leeway={FormatG(bestNode.PathLeeway)},startScore={ctx.ThetaStar.NodeByIndex(startIndex).Score}),{comparison}).";
+        return $"pathTrace(at={currentTime:HH:mm:ss.fff},playerXZ=({playerPosition.X:F1},{playerPosition.Z:F1}),playerY={playerHeightY:F2},hints={hints.GoalZones.Count}goals/{forbiddenZones.Count}forbidden,map=center({map.Center.X:F1},{map.Center.Z:F1}),size={map.Width}x{map.Height}@{map.Resolution:F2},rotation={map.Rotation.Deg:F1},bounds={map.MinX}:{map.MinY}-{map.MaxX}:{map.MaxY},start=raw{startGridRaw}/inBounds:{startInBounds}/used{startGrid}/maxG:{FormatG(startMaxG)}/prio:{startPriority:F2},emergency={emergencyMode},constrained={blockedCells}/{numPixels},goalPixels={positivePriorityCells}/safe:{safePriorityCells}/maxPrio:{map.MaxPriority:F2},goalCoverage=[{string.Join(",", goalCoverage)}]{(hints.GoalZones.Count > goalCoverage.Count ? ",..." : "")},forbiddenCoverage=[{string.Join(",", forbiddenCoverage)}]{(forbiddenZones.Count > forbiddenCoverage.Count ? ",..." : "")},segment={segment},search(steps={ctx.ThetaStar.NumSteps},visitedGoals={visited.VisitedGoalCells}/{reachablePriorityCells},visitedMax={visited.VisitedMaxPriorityCells}/{reachableMaxPriorityCells},best=({bestGrid.x},{bestGrid.y})@({bestPos.X:F1},{bestPos.Z:F1}),score={bestNode.Score},g={bestNode.GScore:F2},h={bestNode.HScore:F2},leeway={FormatG(bestNode.PathLeeway)},startScore={ctx.ThetaStar.NodeByIndex(startIndex).Score}),{comparison}).";
     }
 
     private static string DescribeCandidateComparison(Context ctx, WPos? comparisonGoal, int bestNodeIndex)
@@ -226,7 +407,7 @@ public struct NavigationDecision
         return $"paired(prior=({prior.X:F1},{prior.Z:F1})/cell:{raw.x}:{raw.y}/status:{priorStatus}/priority:{priority:F3}/maxG:{maxG:F2}/score:{(priorOpen ? priorNode.Score.ToString() : "n/a")}/g:{(priorOpen ? priorNode.GScore.ToString("F2") : "n/a")}/h:{(priorOpen ? priorNode.HScore.ToString("F2") : "n/a")},winner=cell:{map.IndexToGrid(bestNodeIndex)}/status:{(winnerOpen ? "evaluated" : "not-evaluated")}/priority:{map.PixelPriority[bestNodeIndex]:F3}/score:{winnerNode.Score}/g:{winnerNode.GScore:F2}/h:{winnerNode.HScore:F2},compareNodeScores={comparison}; negative means prior candidate ranks better, positive means winner ranks better; ranking=safety-class then higher goal priority then G+H then larger G tie-break)";
     }
 
-    private static string DescribeFirstSegment(Map map, AIHints hints, WPos start, WPos? waypoint, DateTime currentTime)
+    private static string DescribeFirstSegment(Map map, AIHints hints, WPos start, WPos? waypoint, DateTime currentTime, List<(Sdf shape, DateTime activation, ulong tag)> forbiddenZones)
     {
         if (waypoint is not { } end)
             return "none";
@@ -252,9 +433,9 @@ public struct NavigationDecision
             var g = map.PixelMaxG[map.GridToIndex(cell.x, cell.y)];
             var point = map.GridToWorld(cell.x, cell.y, 0.5f, 0.5f);
             if (firstForbidden == "none")
-                for (var i = 0; i < hints.ForbiddenZones.Count; ++i)
+                for (var i = 0; i < forbiddenZones.Count; ++i)
                 {
-                    var zone = hints.ForbiddenZones[i];
+                    var zone = forbiddenZones[i];
                     if (zone.shape.Check(point))
                     {
                         firstForbidden = $"{i}/src:{zone.tag}/activeIn:{(zone.activation - currentTime).TotalSeconds:F1}s";
